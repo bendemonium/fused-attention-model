@@ -1,0 +1,12 @@
+torch
+huggingface_hub
+transformers
+geoopt
+tqdm
+numpy
+einops
+datasets
+scipy
+wandb
+accelerate
+pyyaml
