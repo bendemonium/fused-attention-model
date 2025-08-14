@@ -1,6 +1,7 @@
 # mine
 .env
-fusenv
+fusenv/
+wandb/
 
 
 #------------------------- template --------------------------

@@ -136,11 +136,12 @@ class LorentzSelfAttention(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,                      # (B,T,D)
-        anchor_p: torch.Tensor,               # (n+1,) manifold anchor (per block)
-        mask: Optional[torch.Tensor] = None,  # (B,1,T,T)
+        x: torch.Tensor,                              # (B,T,D)
+        anchor_p: Optional[torch.Tensor] = None,      # (n+1,) or (B,T,A); if None -> origin
+        mask: Optional[torch.Tensor] = None,          # (B,1,T,T)
         return_attn: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        return_points: bool = False,                   # <-- NEW: return (B,T,A) manifold points
+        ): 
         B, T, D = x.shape
         H, n, A = self.num_heads, self.n, self.ambient
 
@@ -180,13 +181,28 @@ class LorentzSelfAttention(nn.Module):
             u = (attn.unsqueeze(-1) * logv).sum(dim=3)           # (B,H,T,A)
             Y = exp_map(Y, u)                                    # (B,H,T,A)
 
-        # Combine heads in ambient: concat along A
-        Yc = Y.transpose(1, 2).contiguous().view(B, T, H * A)    # (B,T,H*A)
+        # Token-level manifold representative (average across heads) for fusion:
+        Y_token = Y.mean(dim=1)  # (B,T,A)
 
-        # Log-map at the per-block anchor (shared across tokens) and project back to d_model
-        p = anchor_p.to(Yc.dtype).to(Yc.device).view(1, 1, A).expand(B, T, A)  # (B,T,A)
-        Z_tan = log_map(p, Yc.view(B, T, H, A)).view(B, T, H * A)              # (B,T,H*A)
-        Z = self.o_proj(Z_tan)                                                 # (B,T,D)
+        if return_points and not return_attn:
+            # Return just manifold points for fusion path
+            return Y_token
+        if return_points and return_attn:
+            return (Y_token, attn)
+
+        # Otherwise produce Euclidean output Z (block’s usual residual path)
+        # Combine heads in ambient (concat); log-map @ anchor and project to D
+        Yc = Y.transpose(1, 2).contiguous().view(B, T, H * A)  # (B,T,H*A)
+        if anchor_p is None:
+            # default to origin anchor if not provided
+            p0 = origin(n, dtype=Y.dtype, device=Y.device).view(1, 1, A).expand(B, T, A)
+        else:
+            p0 = anchor_p.to(Y.dtype).to(Y.device)
+            if p0.dim() == 1:   # (A,)
+                p0 = p0.view(1, 1, A).expand(B, T, A)
+        Z_tan = log_map(p0, Y.view(B, H, T, A).transpose(1, 2))  # (B,T,H,A)
+        Z_tan = Z_tan.reshape(B, T, H * A)                        # (B,T,H*A)
+        Z = self.o_proj(Z_tan)                                    # (B,T,D)
         Z = self.dropout_proj(Z)
         return (Z, attn if return_attn else None)
 

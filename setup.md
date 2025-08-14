@@ -5,12 +5,7 @@ on lambda :/
 
 start off with the python configs first
 
-```
-sudo apt install -y software-properties-common
-sudo add-apt-repository -y ppa:deadsnakes/ppa
-sudo apt update
-sudo apt install -y python3.11 python3.11-venv python3.11-dev
-```
+
 
 then the cloning comes in
 
@@ -36,6 +31,18 @@ pip install "numpy<2.0"
 ```
 ```
 pip install -r requirements.txt
+```
+docker
+```
+# host (GH200)
+docker --version            # ensure Docker is installed
+sudo nvidia-smi             # driver visible (you already have this)
+sudo docker run --gpus all -it --rm \
+  -v $PWD:/workspace -w /workspace \
+  nvcr.io/nvidia/pytorch:24.08-py3
+```
+```
+pip install --upgrade --index-url https://download.pytorch.org/whl/cu121 torch torchvision torchaudio
 ```
 ```
 python -c "import jax; print(jax.__version__); print(jax.devices())"

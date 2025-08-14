@@ -65,21 +65,32 @@ class FuseFormerBlock(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         h = self.ln_attn(x)
 
-        e_out = self.euclid_attn(h, mask=attn_mask)   # (B,T,D)
-        y_h  = self.hyp_attn(h, mask=attn_mask)       # (B,T,A) manifold points
+        euclid_out = self.euclid_attn(h, mask=attn_mask)
+        if isinstance(euclid_out, tuple):
+            e_out, _ = euclid_out          # (B,T,D), (B,H,T,T) or similar
+        else:
+            e_out = euclid_out             # already a tensor
 
-        z_fused, alpha = self.fuse(e_out, y_h)        # (B,T,D), (B,T,1)
+        # Hyperbolic branch returns manifold points (B,T,A) as requested
+        y_h = self.hyp_attn(
+            h,
+            anchor_p=self.fuse.anchor,
+            mask=attn_mask,
+            return_points=True
+        )
+
+        # On-manifold fusion
+        z_fused, alpha = self.fuse(e_out, y_h)
         x = x + self.drop_resid(z_fused)
 
         z = self.ffn(self.ln_ffn(x))                  # Euclidean FFN
         x = x + self.drop_resid(z)
-
         return (x, alpha if return_alpha else None)
 
 
 class FuseFormerEncoder(nn.Module):
     """
-    Token embedding -> L × FuseFormerBlock -> final LayerNorm.
+    Token embedding -> L x FuseFormerBlock -> final LayerNorm.
     """
     def __init__(self, cfg: FuseFormerConfig):
         super().__init__()
