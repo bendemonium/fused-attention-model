@@ -1,0 +1,43 @@
+{
+  "os":  "macOS-15.6-arm64-arm-64bit",
+  "python":  "CPython 3.11.7",
+  "startedAt":  "2025-08-14T18:54:41.344123Z",
+  "args":  [
+    "--config",
+    "configs/mixed_test.yaml",
+    "--model",
+    "mixed"
+  ],
+  "program":  "/Users/ridhibandaru/Desktop/research/babylm25/fused-attention-model/scripts/train.py",
+  "codePath":  "scripts/train.py",
+  "codePathLocal":  "scripts/train.py",
+  "git":  {
+    "remote":  "https://github.com/bendemonium/fused-attention-model.git",
+    "commit":  "729cd22206da186caa538b525e52bb9593da73d0"
+  },
+  "email":  "ridhib2422@gmail.com",
+  "root":  "/Users/ridhibandaru/Desktop/research/babylm25/fused-attention-model",
+  "host":  "MacBookPro.lan",
+  "executable":  "/Users/ridhibandaru/Desktop/research/babylm25/fused-attention-model/fusenv/bin/python",
+  "cpu_count":  10,
+  "cpu_count_logical":  10,
+  "disk":  {
+    "/":  {
+      "total":  "994662584320",
+      "used":  "865170333696"
+    }
+  },
+  "memory":  {
+    "total":  "17179869184"
+  },
+  "apple":  {
+    "name":  "Apple M1 Pro",
+    "ecpuCores":  2,
+    "pcpuCores":  8,
+    "gpuCores":  16,
+    "memoryGb":  16,
+    "swapTotalBytes":  "25769803776",
+    "ramTotalBytes":  "17179869184"
+  },
+  "writerId":  "9xcjqalvqpyp4n1tjao5gv1sxqq3xofp"
+}

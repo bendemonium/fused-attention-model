@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from more_model_utils import make_padding_mask, LayerNorm, FeedForward, RotaryEmbedding
+from .more_model_utils import make_padding_mask, LayerNorm, FeedForward, RotaryEmbedding
 
 # ------------------------------
 # RoPE (Rotary Positional Embeddings)

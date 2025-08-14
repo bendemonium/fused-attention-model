@@ -14,11 +14,10 @@ from transformers import get_scheduler
 
 import geoopt
 
-# Your modules
-from models.fuseformer_config import FuseFormerConfig
-from models.fuseformer import FuseFormerForMaskedLM
-from models.euclidean import EuclideanEncoder
-from models.hyperbolic import HyperbolicEncoder
+from model.fuseformerconfig import FuseFormerConfig
+from model.fuseformer import FuseFormerForMaskedLM
+from model.euclidean import EuclideanEncoder
+from model.hyperbolic import HyperbolicEncoder
 
 # Utils
 from utils.train_utils import (
@@ -197,7 +196,7 @@ def main():
     collate_fn = collate_builder(pad_id, vocab_size, mask_id, mlm_prob)
 
     train_loader = DataLoader(train_ds, batch_size=int(cfg.get("batch_size", 32)), shuffle=True, num_workers=2, collate_fn=collate_fn)
-    dev_loader = DataLoader(dev_ds, batch_size=int(cfg.get("eval_batch_size", cfg.get("batch_size", 32))), shuffle=False, num_workers=2, collate_fn=collate_fn)
+    dev_loader = DataLoader(dev_ds, batch_size=int(cfg.get("eval_batch_size", cfg.get("batch_size", 32))), shuffle=False, num_workers=int(cfg.get("num_workers", 0)), collate_fn=collate_fn)
 
     # ----- Model -----
     if args.model == "mixed":

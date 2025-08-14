@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import geoopt
 
-from more_model_utils import make_padding_mask, LayerNorm, FeedForward, RotaryEmbedding
+from .more_model_utils import make_padding_mask, LayerNorm, FeedForward, RotaryEmbedding
 
 
 # ------------------------------

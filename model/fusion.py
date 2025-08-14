@@ -1,148 +1,114 @@
 from __future__ import annotations
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers import PreTrainedModel
+import geoopt
 
-from .more_model_utils import LayerNorm, FeedForward, make_padding_mask
-from .euclidean import MultiHeadAttention as EuclidMHA
-from .hyperbolic import LorentzSelfAttentionManifold  # expected to return (B,T,A) manifold points
-from .fusion import FusionOnManifold                   # on-manifold barycentric fusion + log-map->D
-from .fuseformerconfig import FuseFormerConfig
+# Reuse Lorentz ops from the hyperbolic module (no circular import there)
+from .hyperbolic import minkowski_inner, exp_map, log_map, origin
 
 
-class FuseFormerBlock(nn.Module):
-    def __init__(self, cfg: FuseFormerConfig):
+def project_tangent(p: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """
+    Project arbitrary ambient vector v onto the tangent space T_p H^n:
+      T_p H^n = { u : <p,u>_L = 0 }  with Minkowski inner product.
+    Using: u = v + <p,v>_L * p
+    Shapes:
+      p: (..., A)
+      v: (..., A)
+    """
+    coeff = minkowski_inner(p, v).unsqueeze(-1)   # (...,1)
+    return v + coeff * p
+
+
+class FusionOnManifold(nn.Module):
+    """
+    On-manifold fusion of:
+      - Euclidean features e_out ∈ R^{B×T×D}
+      - Hyperbolic points y_h ∈ H^n ⊂ R^{n+1} as ambient coords (B×T×A), A=n+1
+
+    Steps:
+      1) Compute gate α(x)∈(0,1) from [e_out, log_p(y_h)→R^D]
+      2) Lift e_out to tangent at anchor p (ManifoldParameter), then exp_p → x_e ∈ H^n
+      3) Geodesic interpolation: z_m = Exp_{x_e}( α * Log_{x_e}(y_h) )
+      4) Map back to tangent at p: z_t = Log_p(z_m) ∈ R^{A}
+      5) Linear proj A→D to return fused Euclidean features (B×T×D)
+
+    Returns:
+      z_fused: (B,T,D)
+      alpha:   (B,T,1)  (for interpretability)
+    """
+    def __init__(
+        self,
+        d_model: int,
+        ambient_dim: int,             # A = n+1
+        gate_hidden: int = 64,
+        fusion_karcher_steps: int = 1 # reserved (we use single-step geodesic interp)
+    ):
         super().__init__()
-        D = cfg.d_model
-        H = cfg.num_heads
-        n = cfg.lorentz_spatial_dim
-        A = n + 1
+        self.D = d_model
+        self.A = ambient_dim
 
-        self.ln_attn = LayerNorm(D, eps=cfg.layer_norm_eps)
+        # ---- Learnable anchor p ∈ H^n (Riemannian parameter) ----
+        self.manifold = geoopt.manifolds.Lorentz()
+        with torch.no_grad():
+            o = origin(self.A - 1, dtype=torch.float32, device=torch.device("cpu"))  # (A,)
+            # tiny tangent at origin, then move to a valid point near origin
+            eps = torch.zeros(self.A)
+            eps[1:] = torch.randn(self.A - 1) * 1e-2
+            p0 = exp_map(o, eps)
+        self.anchor = geoopt.ManifoldParameter(p0, manifold=self.manifold, requires_grad=True)
 
-        self.euclid_attn = EuclidMHA(
-            d_model=D,
-            n_heads=H,
-            dropout=cfg.attn_dropout,
+        # ---- A few small projections for gating & I/O ----
+        # Use log_p(y_h) -> A, then A->D for gating feature
+        self.h_log_to_d = nn.Linear(self.A, self.D, bias=True)   # φ_h
+        # Lift Euclid to ambient for tangent at p
+        self.e_to_ambient = nn.Linear(self.D, self.A, bias=True) # ψ_e
+        # Output projection from ambient tangent back to D
+        self.out_proj = nn.Linear(self.A, self.D, bias=True)     # W_o
+
+        # Gate α from concatenated Euclid & hyperbolic (in D)
+        self.gate = nn.Sequential(
+            nn.Linear(2 * self.D, gate_hidden),
+            nn.GELU(),
+            nn.Linear(gate_hidden, 1),
         )
 
-        self.hyp_attn = LorentzSelfAttentionManifold(
-            d_model=D,
-            num_heads=H,
-            spatial_dim=n,
-            tau=cfg.lorentz_tau,
-            attn_dropout=cfg.attn_dropout,
-            rope_max_seq_len=cfg.rope_max_seq_len,
-            karcher_steps=cfg.karcher_steps,
-        )
+        self.sigmoid = nn.Sigmoid()
 
-        self.fuse = FusionOnManifold(
-            d_model=D,
-            ambient_dim=A,
-            gate_hidden=cfg.fusion_gate_hidden,
-            fusion_karcher_steps=cfg.fusion_karcher_steps,
-        )
+    def forward(self, e_out: torch.Tensor, y_h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        e_out: (B,T,D)  Euclidean stream (post-attn)
+        y_h:   (B,T,A)  Hyperbolic stream (ambient coords on H^n)
 
-        self.ln_ffn = LayerNorm(D, eps=cfg.layer_norm_eps)
-        self.ffn = FeedForward(D, cfg.d_ff, dropout=cfg.dropout, activation="gelu")
-        self.drop_resid = nn.Dropout(cfg.dropout)
+        returns:
+          z_fused: (B,T,D)
+          alpha:   (B,T,1)
+        """
+        B, T, D = e_out.shape
+        assert D == self.D, "d_model mismatch"
 
-    def forward(
-        self,
-        x: torch.Tensor,                    # (B,T,D)
-        attn_mask: Optional[torch.Tensor],  # (B,1,T,T)
-        return_alpha: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        h = self.ln_attn(x)
+        # ---- Gate α(e, y) ∈ (0,1) ----
+        # Use log-map at anchor p to extract hyperbolic features in ambient tangent, then A->D
+        p = self.anchor.to(y_h.dtype).to(y_h.device).view(1, 1, self.A).expand(B, T, self.A)  # (B,T,A)
+        y_tan_at_p = log_map(p, y_h)                          # (B,T,A)
+        h_feat = self.h_log_to_d(y_tan_at_p)                  # (B,T,D)
+        g_in = torch.cat([e_out, h_feat], dim=-1)             # (B,T,2D)
+        alpha = self.sigmoid(self.gate(g_in))                 # (B,T,1)
 
-        e_out = self.euclid_attn(h, mask=attn_mask)   # (B,T,D)
-        y_h  = self.hyp_attn(h, mask=attn_mask)       # (B,T,A) manifold points
+        # ---- Lift Euclidean to H^n via tangent at p ----
+        v_raw = self.e_to_ambient(e_out)                      # (B,T,A)
+        v_tan = project_tangent(p, v_raw)                     # (B,T,A) ensure <p,v>=0
+        x_e = exp_map(p, v_tan)                               # (B,T,A) on H^n
 
-        z_fused, alpha = self.fuse(e_out, y_h)        # (B,T,D), (B,T,1)
-        x = x + self.drop_resid(z_fused)
+        # ---- Geodesic interpolation toward y_h with weight α ----
+        # z_m = Exp_{x_e}( α * Log_{x_e}(y_h) )
+        log_xe_y = log_map(x_e, y_h)                          # (B,T,A)
+        step = alpha * log_xe_y                                # (B,T,A)
+        z_m = exp_map(x_e, step)                              # (B,T,A)
 
-        z = self.ffn(self.ln_ffn(x))                  # Euclidean FFN
-        x = x + self.drop_resid(z)
-
-        return (x, alpha if return_alpha else None)
-
-
-class FuseFormerEncoder(nn.Module):
-    def __init__(self, cfg: FuseFormerConfig):
-        super().__init__()
-        self.cfg = cfg
-        self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.layers = nn.ModuleList([FuseFormerBlock(cfg) for _ in range(cfg.num_layers)])
-        self.ln_final = LayerNorm(cfg.d_model, eps=cfg.layer_norm_eps)
-        self.dropout = nn.Dropout(cfg.dropout)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,                 # (B,T)
-        attention_mask: Optional[torch.Tensor],  # (B,T) 1=real, 0=pad
-        return_alphas: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]]]:
-        x = self.embed_tokens(input_ids)                 # (B,T,D)
-        x = self.dropout(x)
-        mask = make_padding_mask(attention_mask) if attention_mask is not None else None
-
-        alpha_logs: List[torch.Tensor] = []
-        for blk in self.layers:
-            x, alpha = blk(x, mask, return_alpha=return_alphas)
-            if return_alphas:
-                alpha_logs.append(alpha)                 # each (B,T,1)
-
-        x = self.ln_final(x)
-        return x, (alpha_logs if return_alphas else None)
-
-
-class FuseFormerForMaskedLM(PreTrainedModel):
-    config_class = FuseFormerConfig
-
-    def __init__(self, config: FuseFormerConfig):
-        super().__init__(config)
-        self.encoder = FuseFormerEncoder(config)
-        if not config.tie_word_embeddings:
-            self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        self.tie_weights()
-
-    def get_input_embeddings(self) -> nn.Embedding:
-        return self.encoder.embed_tokens
-
-    def set_input_embeddings(self, value: nn.Embedding):
-        self.encoder.embed_tokens = value
-        if getattr(self.config, "tie_word_embeddings", True) and hasattr(self, "lm_head"):
-            self.lm_head.weight = self.encoder.embed_tokens.weight
-
-    def tie_weights(self):
-        if getattr(self.config, "tie_word_embeddings", True):
-            if hasattr(self, "lm_head"):
-                self.lm_head.weight = self.encoder.embed_tokens.weight
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,   # -100 to ignore
-        output_alphas: bool = False,
-        **unused: Any,
-    ) -> Dict[str, torch.Tensor]:
-        hidden, alphas = self.encoder(input_ids, attention_mask, return_alphas=output_alphas)
-
-        if getattr(self.config, "tie_word_embeddings", True):
-            logits = torch.matmul(hidden, self.encoder.embed_tokens.weight.t())  # (B,T,V)
-        else:
-            logits = self.lm_head(hidden)
-
-        out: Dict[str, torch.Tensor] = {"logits": logits}
-        if output_alphas and alphas is not None:
-            out["alphas"] = torch.stack(alphas, dim=0)  # (L,B,T,1)
-
-        if labels is not None:
-            vocab = logits.size(-1)
-            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-            out["loss"] = loss_fct(logits.view(-1, vocab), labels.view(-1))
-
-        return out
+        # ---- Map back to Euclid: log at anchor p then linear A->D ----
+        z_tan = log_map(p, z_m)                               # (B,T,A)
+        z_fused = self.out_proj(z_tan)                        # (B,T,D)
+        return z_fused, alpha

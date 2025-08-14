@@ -1,0 +1,53 @@
+dataset_repo: bendemonium/babylm25_bpe_tokens
+train_pkl: train_tokenized.pkl
+dev_pkl: dev_tokenized.pkl
+test_pkl: test_tokenized.pkl
+
+output_dir: runs/mixed_test
+
+vocab_size: 50257           # GPT-2
+pad_token_id: 50256
+mask_token_id: 50264
+mlm_prob: 0.15
+
+d_model: 256
+num_layers: 4
+num_heads: 8
+d_ff: 256
+dropout: 0.1
+attn_dropout: 0.0
+rope_max_seq_len: 512
+lorentz_spatial_dim: 32
+lorentz_tau: 1.0
+karcher_steps: 1
+fusion_gate_hidden: 64
+fusion_karcher_steps: 1
+layer_norm_eps: 1e-5
+tie_word_embeddings: true
+
+batch_size: 32
+eval_batch_size: 32
+epochs: 2
+lr: 3e-4
+lr_anchors: 3e-4
+weight_decay: 0.01
+warmup_steps: 200
+lr_scheduler: linear
+max_grad_norm: 1.0
+amp_dtype: fp16            # GH200-friendly (set to fp16 if needed)
+
+push_every_milestone: true
+hf_repo: bendemonium/fused-attention-model-test
+hf_private: true
+hf_create_repo: true
+hf_branch_prefix: words-
+milestones_words: ["01m","02m","03m","04m","05m","06m","07m","08m","09m","10m",
+                    "20m","30m","40m","50m","60m","70m","80m","90m"]
+
+wandb_mode: online
+wandb_project: fuseformer
+wandb_entity:
+wandb_run_name: mixed_test
+wandb_log_every: 10
+
+num_workers: 0

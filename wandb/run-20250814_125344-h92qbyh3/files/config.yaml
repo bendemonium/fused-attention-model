@@ -1,0 +1,151 @@
+_wandb:
+    value:
+        cli_version: 0.21.1
+        e:
+            ei34tpvgugvk0e03bqkqiwkdxr0zwrzu:
+                args:
+                    - --config
+                    - configs/mixed_test.yaml
+                    - --model
+                    - mixed
+                codePath: scripts/train.py
+                codePathLocal: scripts/train.py
+                email: ridhib2422@gmail.com
+                executable: /Users/ridhibandaru/Desktop/research/babylm25/fused-attention-model/fusenv/bin/python
+                git:
+                    commit: 729cd22206da186caa538b525e52bb9593da73d0
+                    remote: https://github.com/bendemonium/fused-attention-model.git
+                host: MacBookPro.lan
+                os: macOS-15.6-arm64-arm-64bit
+                program: /Users/ridhibandaru/Desktop/research/babylm25/fused-attention-model/scripts/train.py
+                python: CPython 3.11.7
+                root: /Users/ridhibandaru/Desktop/research/babylm25/fused-attention-model
+                startedAt: "2025-08-14T17:53:44.444268Z"
+                writerId: ei34tpvgugvk0e03bqkqiwkdxr0zwrzu
+        m: []
+        python_version: 3.11.7
+        t:
+            "1":
+                - 1
+                - 11
+                - 49
+                - 71
+            "2":
+                - 1
+                - 11
+                - 49
+                - 71
+            "3":
+                - 13
+                - 16
+            "4": 3.11.7
+            "5": 0.21.1
+            "6": 4.55.2
+            "12": 0.21.1
+            "13": darwin-arm64
+amp_dtype:
+    value: fp16
+attn_dropout:
+    value: 0
+batch_size:
+    value: 32
+d_ff:
+    value: 256
+d_model:
+    value: 256
+dataset_repo:
+    value: bendemonium/babylm25_bpe_tokens
+dev_pkl:
+    value: dev.pkl
+dropout:
+    value: 0.1
+epochs:
+    value: 2
+eval_batch_size:
+    value: 32
+fusion_gate_hidden:
+    value: 64
+fusion_karcher_steps:
+    value: 1
+hf_branch_prefix:
+    value: words-
+hf_create_repo:
+    value: true
+hf_private:
+    value: true
+hf_repo:
+    value: bendemonium/fused-attention-model-test
+karcher_steps:
+    value: 1
+layer_norm_eps:
+    value: "1e-5"
+lorentz_spatial_dim:
+    value: 32
+lorentz_tau:
+    value: 1
+lr:
+    value: "3e-4"
+lr_anchors:
+    value: "3e-4"
+lr_scheduler:
+    value: linear
+mask_token_id:
+    value: 50264
+max_grad_norm:
+    value: 1
+milestones_words:
+    value:
+        - 01m
+        - 02m
+        - 03m
+        - 04m
+        - 05m
+        - 06m
+        - 07m
+        - 08m
+        - 09m
+        - 10m
+        - 20m
+        - 30m
+        - 40m
+        - 50m
+        - 60m
+        - 70m
+        - 80m
+        - 90m
+mlm_prob:
+    value: 0.15
+num_heads:
+    value: 8
+num_layers:
+    value: 4
+output_dir:
+    value: runs/mixed_test
+pad_token_id:
+    value: 50256
+push_every_milestone:
+    value: true
+rope_max_seq_len:
+    value: 512
+test_pkl:
+    value: test.pkl
+tie_word_embeddings:
+    value: true
+train_pkl:
+    value: train.pkl
+vocab_size:
+    value: 50257
+wandb_entity:
+    value: null
+wandb_log_every:
+    value: 10
+wandb_mode:
+    value: online
+wandb_project:
+    value: fuseformer
+wandb_run_name:
+    value: mixed_test
+warmup_steps:
+    value: 200
+weight_decay:
+    value: 0.01

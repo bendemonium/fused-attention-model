@@ -1,4 +1,3 @@
-# utils/train_utils.py
 from __future__ import annotations
 import os
 import re
@@ -14,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 import torch
+import numpy as np
 import geoopt
 from tqdm.auto import tqdm
 
@@ -59,28 +59,68 @@ def setup_wandb(cfg: Dict[str, Any]) -> Optional[Any]:
 # ---------------------------
 
 def _to_list_of_dicts(obj: Any) -> List[Dict[str, Any]]:
-    """
-    Normalize various pickled formats into a list of dicts with keys at least:
-      - input_ids (List[int] or Tensor)
-      - attention_mask (optional)
-      - labels (optional)
-    Supports: HF Dataset, list-of-dicts, dict-of-lists.
-    """
+    # HF Dataset-like
     if hasattr(obj, "column_names") and hasattr(obj, "__len__") and hasattr(obj, "__getitem__"):
         return [obj[i] for i in range(len(obj))]
+
+    # DatasetDict → pick a split (prefer "train")
+    if isinstance(obj, dict) and obj and any(hasattr(v, "column_names") for v in obj.values()):
+        split = obj.get("train") or next(iter(obj.values()))
+        return [split[i] for i in range(len(split))]
+
+    # list-of-dicts
+    if isinstance(obj, list) and obj and isinstance(obj[0], dict):
+        return obj
+
+    # dict of lists/tuples
     if isinstance(obj, dict) and obj and all(isinstance(v, (list, tuple)) for v in obj.values()):
         keys = list(obj.keys()); n = len(obj[keys[0]])
         return [{k: obj[k][i] for k in keys} for i in range(n)]
-    if isinstance(obj, list) and obj and isinstance(obj[0], dict):
-        return obj
-    raise ValueError("Unsupported pickled dataset format. Expect HF Dataset, list-of-dicts, or dict-of-lists.")
+
+    # dict of tensors/ndarrays -> row-wise dicts
+    if isinstance(obj, dict) and obj and all(hasattr(v, "shape") for v in obj.values()):
+        keys = list(obj.keys())
+        n = int(next(iter(obj.values())).shape[0])
+        out = []
+        for i in range(n):
+            d = {}
+            for k, v in obj.items():
+                vi = v[i]
+                if isinstance(vi, np.ndarray):
+                    # convert to torch.LongTensor row-by-row to avoid huge copies
+                    vi = torch.from_numpy(vi).long() if vi.dtype.kind in "iu" else torch.from_numpy(vi)
+                elif isinstance(vi, torch.Tensor) and vi.dtype not in (torch.long, torch.int64):
+                    vi = vi.long()
+                d[k] = vi
+            out.append(d)
+        return out
+
+    # tuple/list of tensors (input_ids[, attention_mask[, labels]])
+    if isinstance(obj, (list, tuple)) and obj and all(hasattr(x, "shape") for x in obj):
+        ids = obj[0]; am = obj[1] if len(obj) > 1 else None; lab = obj[2] if len(obj) > 2 else None
+        n = ids.shape[0]
+        out = []
+        for i in range(n):
+            d = {"input_ids": torch.as_tensor(ids[i]).long()}
+            if am is not None:  d["attention_mask"] = torch.as_tensor(am[i]).long()
+            if lab is not None: d["labels"] = torch.as_tensor(lab[i]).long()
+            out.append(d)
+        return out
+
+    # Fallback: generic indexable object yielding dicts
+    if hasattr(obj, "__len__") and hasattr(obj, "__getitem__"):
+        try:
+            first = obj[0]
+            if isinstance(first, dict):
+                return [obj[i] for i in range(len(obj))]
+        except Exception:
+            pass
+
+    raise ValueError("Unsupported pickled dataset format after robust conversion.")
 
 
 def hf_download_and_load_pkl(repo_id: str, filename: str, revision: Optional[str] = None, token: Optional[str] = None) -> List[Dict[str, Any]]:
-    """
-    Download a .pkl from a HF dataset repo and return list-of-dicts ready for batching.
-    """
-    local_path = hf_hub_download(repo_id=repo_id, filename=filename, revision=revision, token=token)
+    local_path = hf_hub_download(repo_id=repo_id, filename=filename, revision=revision, token=token, repo_type="dataset")
     with open(local_path, "rb") as f:
         obj = pickle.load(f)
     data = _to_list_of_dicts(obj)
