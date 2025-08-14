@@ -2,14 +2,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
 
-import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import geoopt
 
 from .more_model_utils import make_padding_mask, LayerNorm, FeedForward, RotaryEmbedding
-
 
 # ------------------------------
 # Lorentz (hyperboloid) ops
@@ -17,44 +14,57 @@ from .more_model_utils import make_padding_mask, LayerNorm, FeedForward, RotaryE
 
 EPS = 1e-6
 TINY = 1e-15
+MAX_ACOSH_ARG = 1e6          # cap for alpha before acosh
+MAX_DIST = 50.0              # cap for geodesic distances (stability)
 
 def minkowski_inner(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    # <x,y>_L = -x0*y0 + sum_{i=1..n} xi*yi
+    """
+    Lorentzian inner product <x,y>_L = -x0*y0 + sum_{i=1..n} xi*yi
+    Works with broadcasting over leading dims; last dim is ambient (n+1).
+    """
     return -x[..., 0] * y[..., 0] + (x[..., 1:] * y[..., 1:]).sum(dim=-1)
 
 def project_to_hyperboloid(x: torch.Tensor) -> torch.Tensor:
-    # Re-normalize onto H^n: <x,x>_L = -1, x0>0
+    """Re-normalize onto H^n: <x,x>_L = -1, x0>0."""
     xx = minkowski_inner(x, x)
     scale = torch.sqrt(xx.abs().clamp_min(TINY)).unsqueeze(-1)
     x = x / scale
     x0 = x[..., :1].abs()  # ensure time-like positive
     return torch.cat([x0, x[..., 1:]], dim=-1)
 
-def safe_arcosh(z: torch.Tensor) -> torch.Tensor:
-    return torch.arccosh(z.clamp_min(1.0 + EPS))
+def safe_arcosh_torch(z: torch.Tensor) -> torch.Tensor:
+    """acosh with a minimum clamp to keep inside domain."""
+    return torch.acosh(z.clamp_min(1.0 + EPS))
 
 def lorentz_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    # d_H(x,y) = arcosh(-<x,y>_L)
-    return safe_arcosh(-minkowski_inner(x, y))
+    """d_H(x,y) = acosh(-<x,y>_L)."""
+    return safe_arcosh_torch(-minkowski_inner(x, y))
 
 def lorentz_norm_tangent(v: torch.Tensor) -> torch.Tensor:
     vv = minkowski_inner(v, v)
     return torch.sqrt(vv.clamp_min(TINY))
 
 def exp_map(p: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    # exp_p(v) on H^n
-    vn = lorentz_norm_tangent(v).unsqueeze(-1)
+    """
+    Exponential map on H^n at base point p for tangent vector v.
+    Both p and v live in ambient R^{n+1}; v must be tangent at p.
+    """
+    vn = lorentz_norm_tangent(v).unsqueeze(-1)        # (...,1)
     c1 = torch.cosh(vn)
     c2 = torch.sinh(vn) / vn.clamp_min(TINY)
     y = c1 * p + c2 * v
     return project_to_hyperboloid(y)
 
 def log_map(p: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    # log_p(y) on H^n
-    alpha = -minkowski_inner(p, y)
-    dist = safe_arcosh(alpha).unsqueeze(-1)
-    u = y + alpha.unsqueeze(-1) * p
-    un = torch.sqrt(minkowski_inner(u, u).clamp_min(TINY)).unsqueeze(-1)
+    """
+    Logarithm map on H^n at base point p toward y.
+    Returns a tangent vector at p in ambient coords.
+    """
+    alpha = -minkowski_inner(p, y)                                        # (...)
+    alpha = alpha.clamp_min(1.0 + EPS).clamp_max(MAX_ACOSH_ARG)
+    dist = torch.acosh(alpha).unsqueeze(-1)                               # (...,1)
+    u = y + alpha.unsqueeze(-1) * p                                       # (...,A)
+    un = torch.sqrt(minkowski_inner(u, u).clamp_min(TINY)).unsqueeze(-1)  # (...,1)
     return (dist / un.clamp_min(TINY)) * u
 
 def tangent_at_origin(u_spatial: torch.Tensor) -> torch.Tensor:
@@ -73,13 +83,15 @@ def origin(n: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
 class LorentzSelfAttention(nn.Module):
     """
     Lorentz multi-head self-attention.
-    Steps:
+    Pipeline:
       - Linear lift to per-head spatial dims (u_q,u_k,u_v ∈ R^{H*n})
-      - RoPE on u_q,u_k
+      - (Optional) RoPE on u_q,u_k
       - Append time-like 0 → tangent vectors at origin → expmap at origin → points on H^n
-      - Scores = -tau * d_H^2(Q,K); softmax in fp32
-      - Aggregate V by one-step Karcher mean around the query point
-      - Combine heads by concatenating ambient coords → log-map at per-block anchor p → Linear to d_model
+      - Scores = -tau * d_H^2(Q,K); softmax in fp32; all-masked rows guarded
+      - Aggregate V by Karcher steps around Q
+      - Return:
+         * if return_points: (B,T,A) token-level manifold points (head-mean) [+ optional attn]
+         * else: Euclidean projection via log-map@anchor → Linear to d_model, with optional attn
     """
     def __init__(
         self,
@@ -92,6 +104,7 @@ class LorentzSelfAttention(nn.Module):
         rope_max_seq_len: int = 4096,
         use_rope: bool = True,
         karcher_steps: int = 1,
+        pre_lift_scale: float = 1.0,  # reduce early step sizes (stability)
     ):
         super().__init__()
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
@@ -104,6 +117,7 @@ class LorentzSelfAttention(nn.Module):
         self.ambient = spatial_dim + 1
         self.tau = float(tau)
         self.karcher_steps = max(1, karcher_steps)
+        self.pre_lift_scale = float(pre_lift_scale)
 
         # Lift projections (to per-head spatial features)
         self.q_lift = nn.Linear(d_model, num_heads * spatial_dim, bias=True)
@@ -128,26 +142,30 @@ class LorentzSelfAttention(nn.Module):
         # (B,H,T,n) -> (B,H,T,n+1) via exp at origin
         b, h, t, n = u.shape
         zeros = u.new_zeros(b, h, t, 1)
-        v = torch.cat([zeros, u], dim=-1)  # tangent vectors at origin: (0, u)
-        # origin per head
-        o = origin(self.n, dtype=u.dtype, device=u.device)           # (n+1,)
-        o_bht = o.view(1, 1, 1, -1).expand(b, h, t, -1)              # (B,H,T,n+1)
-        return exp_map(o_bht, v)                                     # points on H^n
+        v = torch.cat([zeros, u], dim=-1)                  # tangent vectors at origin: (0, u)
+        o = origin(self.n, dtype=u.dtype, device=u.device) # (n+1,)
+        o_bht = o.view(1, 1, 1, -1).expand(b, h, t, -1)    # (B,H,T,n+1)
+        return exp_map(o_bht, v)                           # points on H^n
 
     def forward(
         self,
         x: torch.Tensor,                              # (B,T,D)
         anchor_p: Optional[torch.Tensor] = None,      # (n+1,) or (B,T,A); if None -> origin
-        mask: Optional[torch.Tensor] = None,          # (B,1,T,T)
+        mask: Optional[torch.Tensor] = None,          # (B,1,T,T) True=keep
         return_attn: bool = False,
-        return_points: bool = False,                   # <-- NEW: return (B,T,A) manifold points
-        ): 
+        return_points: bool = False,
+    ):
         B, T, D = x.shape
         H, n, A = self.num_heads, self.n, self.ambient
 
         uq = self._pack_heads(self.q_lift(x))   # (B,H,T,n)
         uk = self._pack_heads(self.k_lift(x))   # (B,H,T,n)
         uv = self._pack_heads(self.v_lift(x))   # (B,H,T,n)
+
+        # Optional small scale to tame early geodesic steps
+        if self.pre_lift_scale != 1.0:
+            s = self.pre_lift_scale
+            uq, uk, uv = uq * s, uk * s, uv * s
 
         if self.use_rope:
             uq, uk = self.rope(uq, uk)          # RoPE on spatial pre-lift
@@ -156,59 +174,70 @@ class LorentzSelfAttention(nn.Module):
         K = self._append_and_lift(uk)
         V = self._append_and_lift(uv)
 
-        # Scores = -tau * d_H^2(Q,K)
-        # Broadcast to (B,H,T,T,A) for distance; compute in fp32
-        Qe = Q.float().unsqueeze(3)              # (B,H,T,1,A)
-        Ke = K.float().unsqueeze(2)              # (B,H,1,T,A)
-        # d(Qe,Ke) uses Minkowski inner
-        d = safe_arcosh_torch(-minkowski_inner(Qe, Ke))  # (B,H,T,T)
-        scores = -(self.tau) * (d ** 2)
+        # ---------- Numerically safe scores ----------
+        # Distances: d = acosh(alpha), where alpha = -<Q,K>_L  (must be >= 1)
+        Qe = Q.float().unsqueeze(3)   # (B,H,T,1,A)
+        Ke = K.float().unsqueeze(2)   # (B,H,1,T,A)
 
+        alpha = (-minkowski_inner(Qe, Ke)).clamp_min(1.0 + EPS).clamp_max(MAX_ACOSH_ARG)  # (B,H,T,T)
+        d = torch.acosh(alpha).clamp_max(MAX_DIST)                                         # (B,H,T,T)
+        scores = -(self.tau) * (d ** 2)                                                   # (B,H,T,T)
+
+        # Apply mask; then guard "all-masked row" (common for padding tokens)
         if mask is not None:
-            scores = scores.masked_fill(~mask, float("-inf"))
+            scores = scores.masked_fill(~mask, -1e9)
+            # rows with no valid keys → set diagonal to 0 so softmax is well-defined
+            row_has_any = mask.any(dim=-1)             # (B,1,T)
+            no_valid = ~row_has_any                    # (B,1,T)
+            if no_valid.any():
+                TT = scores.size(-1)
+                diag = torch.eye(TT, dtype=torch.bool, device=scores.device).view(1, 1, TT, TT)  # (1,1,T,T)
+                fix = no_valid.unsqueeze(-1) & diag
+                scores = scores.masked_fill(fix.expand(-1, scores.size(1), -1, -1), 0.0)
 
-        attn = torch.softmax(scores, dim=-1).to(V.dtype)  # (B,H,T,T)
+        # Softmax in fp32, then cast back
+        attn = torch.softmax(scores.float(), dim=-1).to(V.dtype)  # (B,H,T,T)
         attn = self.dropout_attn(attn)
 
-        # Aggregate V by Fréchet mean with 1 (or k) Karcher steps around the query point Q
-        # Start at Q (anchor for iteration)
+        # ---------- Karcher aggregation ----------
+        # Start at Q (query point) and iterate a few steps
         Y = Q
         for _ in range(self.karcher_steps):
-            # log_{Y}(V_i) weighted by attn over i
-            Vexp = V.unsqueeze(2).expand(B, H, T, T, A)          # (B,H,T,T,A)
+            Vexp = V.unsqueeze(2).expand(B, H, T, T, A)         # (B,H,T,T,A)
             Yexp = Y.unsqueeze(3).expand(B, H, T, T, A)
-            logv = log_map(Yexp, Vexp)                           # (B,H,T,T,A)
-            u = (attn.unsqueeze(-1) * logv).sum(dim=3)           # (B,H,T,A)
-            Y = exp_map(Y, u)                                    # (B,H,T,A)
+            logv = log_map(Yexp, Vexp)                          # (B,H,T,T,A)
+            # Optional cap on step norm for stability
+            step = (attn.unsqueeze(-1) * logv).sum(dim=3)       # (B,H,T,A)
+            step_norm = torch.sqrt(minkowski_inner(step, step).clamp_min(TINY)).unsqueeze(-1)
+            step = step * ( (step_norm.clamp_max(20.0)) / (step_norm + 1e-9) )
+            Y = exp_map(Y, step)                                # (B,H,T,A)
 
         # Token-level manifold representative (average across heads) for fusion:
         Y_token = Y.mean(dim=1)  # (B,T,A)
 
         if return_points and not return_attn:
-            # Return just manifold points for fusion path
             return Y_token
         if return_points and return_attn:
             return (Y_token, attn)
 
-        # Otherwise produce Euclidean output Z (block’s usual residual path)
-        # Combine heads in ambient (concat); log-map @ anchor and project to D
-        Yc = Y.transpose(1, 2).contiguous().view(B, T, H * A)  # (B,T,H*A)
+        # ---------- Euclidean output path (block residual) ----------
+        # Concatenate heads in ambient, then log-map @ anchor and project to d_model
+        # (We can as well log-map per-head then concat; here we concat ambient then project.)
         if anchor_p is None:
-            # default to origin anchor if not provided
-            p0 = origin(n, dtype=Y.dtype, device=Y.device).view(1, 1, A).expand(B, T, A)
+            p0 = origin(n, dtype=Y.dtype, device=Y.device).view(1, 1, A).expand(B, T, A)  # (B,T,A)
         else:
             p0 = anchor_p.to(Y.dtype).to(Y.device)
-            if p0.dim() == 1:   # (A,)
-                p0 = p0.view(1, 1, A).expand(B, T, A)
-        Z_tan = log_map(p0, Y.view(B, H, T, A).transpose(1, 2))  # (B,T,H,A)
-        Z_tan = Z_tan.reshape(B, T, H * A)                        # (B,T,H*A)
-        Z = self.o_proj(Z_tan)                                    # (B,T,D)
+            if p0.dim() == 1:  # (A,)
+                p0 = p0.view(1, 1, A).expand(B, T, A)                                     # (B,T,A)
+
+        # Log-map per head, then reshape to (B,T,H*A)
+        YbhTA = Y.transpose(1, 2)                             # (B,T,H,A)
+        Z_tan = log_map(p0.unsqueeze(2), YbhTA)               # (B,T,H,A) — base expanded to (B,T,1,A)
+        Z_tan = Z_tan.reshape(B, T, H * A)                    # (B,T,H*A)
+
+        Z = self.o_proj(Z_tan)                                # (B,T,D)
         Z = self.dropout_proj(Z)
         return (Z, attn if return_attn else None)
-
-
-def safe_arcosh_torch(z: torch.Tensor) -> torch.Tensor:
-    return torch.acosh(z.clamp_min(1.0 + EPS))
 
 # ------------------------------
 # Hyperbolic Encoder Block (Pre-LN)
@@ -217,7 +246,7 @@ def safe_arcosh_torch(z: torch.Tensor) -> torch.Tensor:
 class HyperbolicEncoderBlock(nn.Module):
     """
     Pre-LN block with Lorentz attention:
-      x -> LN -> LorentzSelfAttention (manifold) -> log-map@anchor -> +res -> LN -> FFN -> +res
+      x -> LN -> LorentzSelfAttention -> +res -> LN -> FFN -> +res
     Holds a per-block anchor p_ell ∈ H^n as a ManifoldParameter (learned with Riemannian optimizer).
     """
     def __init__(
@@ -234,6 +263,7 @@ class HyperbolicEncoderBlock(nn.Module):
         use_rope: bool = True,
         ln_eps: float = 1e-5,
         karcher_steps: int = 1,
+        pre_lift_scale: float = 1.0,
     ):
         super().__init__()
         self.ln_attn = LayerNorm(d_model, eps=ln_eps)
@@ -248,36 +278,40 @@ class HyperbolicEncoderBlock(nn.Module):
             rope_max_seq_len=rope_max_seq_len,
             use_rope=use_rope,
             karcher_steps=karcher_steps,
+            pre_lift_scale=pre_lift_scale,
         )
 
         self.ln_ffn = LayerNorm(d_model, eps=ln_eps)
         self.ffn = FeedForward(d_model=d_model, d_hidden=d_hidden, dropout=ffn_dropout)
 
-        # Per-block anchor p_ell ∈ H^n as a manifold parameter
-        self.manifold = geoopt.manifolds.Lorentz()  # k=1
-        # Initialize near origin: sample small spatial vector u, exp_o((0,u))
+        # Per-block anchor p_ell ∈ H^n as a manifold parameter (learned by Riemannian optimizer)
+        self.manifold = geoopt.manifolds.Lorentz()  # curvature k=1
         n = spatial_dim
         with torch.no_grad():
-            u = torch.zeros(n + 1)  # (x0=0, spatial zeros) → exp at origin gives origin; we'll add tiny noise
+            # initialize near origin: small spatial noise in tangent, then exp-map
+            u = torch.zeros(n + 1)
             u[1:] = torch.randn(n) * 1e-2
             o = origin(n, dtype=torch.float32, device=torch.device("cpu"))
-            p0 = exp_map(o, u)  # valid point on H^n
+            p0 = exp_map(o, u)
         self.anchor = geoopt.ManifoldParameter(p0, manifold=self.manifold, requires_grad=True)
+
+        self.drop_resid = nn.Dropout(resid_dropout)
 
     def forward(
         self,
         x: torch.Tensor,                      # (B,T,D)
-        attn_mask: Optional[torch.Tensor],   # (B,1,T,T)
+        attn_mask: Optional[torch.Tensor],    # (B,1,T,T)
         return_attn: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], geoopt.ManifoldParameter]:
         h = self.ln_attn(x)
         z, a_weights = self.attn(h, anchor_p=self.anchor, mask=attn_mask, return_attn=return_attn)
-        x = x + z
+        x = x + self.drop_resid(z)
+
         y = self.ln_ffn(x)
         y = self.ffn(y)
-        x = x + y
-        return x, (a_weights if return_attn else None), self.anchor
+        x = x + self.drop_resid(y)
 
+        return x, (a_weights if return_attn else None), self.anchor
 
 # ------------------------------
 # Encoder Stack (Hyperbolic-only)
@@ -298,8 +332,8 @@ class HyperbolicEncoderConfig:
     use_rope: bool = True
     ln_eps: float = 1e-5
     karcher_steps: int = 1
+    pre_lift_scale: float = 1.0
     tie_embeddings: bool = True
-
 
 class HyperbolicEncoder(nn.Module):
     """
@@ -324,6 +358,7 @@ class HyperbolicEncoder(nn.Module):
                 use_rope=cfg.use_rope,
                 ln_eps=cfg.ln_eps,
                 karcher_steps=cfg.karcher_steps,
+                pre_lift_scale=cfg.pre_lift_scale,
             ) for _ in range(cfg.num_layers)
         ])
         if not cfg.tie_embeddings:
@@ -331,7 +366,7 @@ class HyperbolicEncoder(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,            # (B,T)
+        input_ids: torch.Tensor,                      # (B,T)
         attention_mask: Optional[torch.Tensor] = None,  # (B,T)
         return_attn: bool = False,
     ) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]], List[geoopt.ManifoldParameter]]:

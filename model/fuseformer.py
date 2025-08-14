@@ -1,3 +1,4 @@
+# model/fuseformer.py
 from __future__ import annotations
 from typing import Optional, List, Tuple, Dict, Any
 
@@ -7,10 +8,9 @@ from transformers import PreTrainedModel
 
 from .more_model_utils import LayerNorm, FeedForward, make_padding_mask
 from .euclidean import MultiHeadAttentionEuclid as EuclidMHA
-from .hyperbolic import LorentzSelfAttention  # expected to return (B,T,A) manifold points
-from .fusion import FusionOnManifold                   # on-manifold barycentric fusion + log-map->D
-from .fuseformerconfig import FuseFormerConfig
-
+from .hyperbolic import LorentzSelfAttention              # returns points when return_points=True
+from .fusion import FusionOnManifold                      # on-manifold barycentric fusion + log-map->D
+from .fuseformer_config import FuseFormerConfig           # NOTE: underscore in filename
 
 class FuseFormerBlock(nn.Module):
     """
@@ -30,12 +30,14 @@ class FuseFormerBlock(nn.Module):
 
         self.ln_attn = LayerNorm(D, eps=cfg.layer_norm_eps)
 
+        # Euclidean self-attention (returns tensor or (tensor, attn))
         self.euclid_attn = EuclidMHA(
             d_model=D,
             num_heads=H,
             attn_dropout=cfg.attn_dropout,
         )
 
+        # Hyperbolic self-attention (can return manifold points for fusion)
         self.hyp_attn = LorentzSelfAttention(
             d_model=D,
             num_heads=H,
@@ -44,8 +46,10 @@ class FuseFormerBlock(nn.Module):
             attn_dropout=cfg.attn_dropout,
             rope_max_seq_len=cfg.rope_max_seq_len,
             karcher_steps=cfg.karcher_steps,
+            pre_lift_scale=getattr(cfg, "pre_lift_scale", 1.0),
         )
 
+        # On-manifold fusion (owns a learned Lorentz anchor)
         self.fuse = FusionOnManifold(
             d_model=D,
             ambient_dim=A,
@@ -60,37 +64,39 @@ class FuseFormerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,                    # (B,T,D)
-        attn_mask: Optional[torch.Tensor],  # (B,1,T,T)
+        attn_mask: Optional[torch.Tensor],  # (B,1,T,T) True=keep
         return_alpha: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         h = self.ln_attn(x)
 
+        # Euclidean branch
         euclid_out = self.euclid_attn(h, mask=attn_mask)
         if isinstance(euclid_out, tuple):
-            e_out, _ = euclid_out          # (B,T,D), (B,H,T,T) or similar
+            e_out, _ = euclid_out      # we don't use Euclid attn weights here
         else:
-            e_out = euclid_out             # already a tensor
+            e_out = euclid_out         # (B,T,D)
 
-        # Hyperbolic branch returns manifold points (B,T,A) as requested
+        # Hyperbolic branch: get (B,T,A) manifold points, sharing fusion anchor
         y_h = self.hyp_attn(
             h,
-            anchor_p=self.fuse.anchor,
+            anchor_p=self.fuse.anchor,    # keep tangent/anchor consistent with fusion
             mask=attn_mask,
             return_points=True
-        )
+        )  # (B,T,A)
 
-        # On-manifold fusion
-        z_fused, alpha = self.fuse(e_out, y_h)
+        # On-manifold fusion → Euclidean D
+        z_fused, alpha = self.fuse(e_out, y_h)  # (B,T,D), (B,T,1)
         x = x + self.drop_resid(z_fused)
 
-        z = self.ffn(self.ln_ffn(x))                  # Euclidean FFN
+        # Euclidean FFN
+        z = self.ffn(self.ln_ffn(x))
         x = x + self.drop_resid(z)
         return (x, alpha if return_alpha else None)
 
 
 class FuseFormerEncoder(nn.Module):
     """
-    Token embedding -> L x FuseFormerBlock -> final LayerNorm.
+    Token embedding -> L × FuseFormerBlock -> final LayerNorm.
     """
     def __init__(self, cfg: FuseFormerConfig):
         super().__init__()
@@ -102,19 +108,19 @@ class FuseFormerEncoder(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,                 # (B,T)
-        attention_mask: Optional[torch.Tensor],  # (B,T) 1=real, 0=pad
+        input_ids: torch.Tensor,                       # (B,T)
+        attention_mask: Optional[torch.Tensor] = None, # (B,T) 1=real, 0=pad
         return_alphas: bool = False,
     ) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]]]:
-        x = self.embed_tokens(input_ids)                 # (B,T,D)
+        x = self.embed_tokens(input_ids)          # (B,T,D)
         x = self.dropout(x)
         mask = make_padding_mask(attention_mask) if attention_mask is not None else None
 
         alpha_logs: List[torch.Tensor] = []
         for blk in self.layers:
             x, alpha = blk(x, mask, return_alpha=return_alphas)
-            if return_alphas:
-                alpha_logs.append(alpha)                 # each (B,T,1)
+            if return_alphas and alpha is not None:
+                alpha_logs.append(alpha)          # each (B,T,1)
 
         x = self.ln_final(x)
         return x, (alpha_logs if return_alphas else None)
@@ -130,18 +136,30 @@ class FuseFormerForMaskedLM(PreTrainedModel):
             self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.tie_weights()
 
+    # --- Embedding tying APIs expected by HF ---
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.encoder.embed_tokens
 
     def set_input_embeddings(self, value: nn.Embedding):
         self.encoder.embed_tokens = value
         if getattr(self.config, "tie_word_embeddings", True) and hasattr(self, "lm_head"):
+            # weight tying
             self.lm_head.weight = self.encoder.embed_tokens.weight
+
+    def get_output_embeddings(self):
+        return None if getattr(self.config, "tie_word_embeddings", True) else self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        if not getattr(self.config, "tie_word_embeddings", True):
+            self.lm_head = new_embeddings
 
     def tie_weights(self):
         if getattr(self.config, "tie_word_embeddings", True):
             if hasattr(self, "lm_head"):
                 self.lm_head.weight = self.encoder.embed_tokens.weight
+
+    # --- Forward ---
 
     def forward(
         self,
@@ -159,7 +177,7 @@ class FuseFormerForMaskedLM(PreTrainedModel):
             logits = self.lm_head(hidden)
 
         out: Dict[str, torch.Tensor] = {"logits": logits}
-        if output_alphas and alphas is not None:
+        if output_alphas and alphas:
             out["alphas"] = torch.stack(alphas, dim=0)  # (L,B,T,1)
 
         if labels is not None:
