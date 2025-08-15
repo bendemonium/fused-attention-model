@@ -23,16 +23,11 @@ python -m venv bb-env
 source bb-env/bin/activate
 source bb-env/bin/activate
 ```
-```
-pip install --upgrade pip
-pip install --upgrade "jax[cuda12]"
-pip uninstall numpy -y
-pip install "numpy<2.0"
-```
+
 ```
 pip install -r requirements.txt
 ```
-docker
+
 ```
 sudo apt install -y software-properties-common
 sudo add-apt-repository -y ppa:deadsnakes/ppa
@@ -41,9 +36,6 @@ sudo apt install -y python3.11 python3.11-venv python3.11-dev
 ```
 ```
 pip install --upgrade --index-url https://download.pytorch.org/whl/cu121 torch torchvision torchaudio
-```
-```
-python -c "import jax; print(jax.__version__); print(jax.devices())"
 ```
 
 git stuff
@@ -74,13 +66,6 @@ huggingface-cli login
 ```
 export $(grep -v '^#' .env | xargs)
 ```
-
-testin the utils
-```
-python -m utils.test_utils
-```
-
-training dry runs
 
 ```
 # test run
