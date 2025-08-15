@@ -107,6 +107,13 @@ def create_data_collator(tokenizer, mlm_probability: float = 0.15):
     """Create appropriate data collator for MLM training"""
     from transformers import DataCollatorForLanguageModeling
     
+    # GPT-2 doesn't have a mask token, so add one
+    if tokenizer.mask_token is None:
+        # Add mask token to tokenizer
+        special_tokens = {"mask_token": "<mask>"}
+        tokenizer.add_special_tokens(special_tokens)
+        print(f"Added mask token to tokenizer: {tokenizer.mask_token}")
+    
     return DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm=True,

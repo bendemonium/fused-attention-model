@@ -15,10 +15,10 @@ streaming: false
 # =========================
 # Core architecture
 vocab_size: 50257  # GPT-2 vocab size
-d_model: 768       # Hidden dimension
-num_heads: 12      # Attention heads  
-num_layers: 12     # Transformer layers
-d_ff: 3072         # FFN dimension (4 * d_model)
+d_model: 256       # Hidden dimension
+num_heads: 8      # Attention heads  
+num_layers: 4     # Transformer layers
+d_ff: 256         # FFN dimension (4 * d_model)
 max_position_embeddings: 1024
 
 # Regularization
@@ -45,7 +45,7 @@ distance_cap: 5.0          # Cap hyperbolic distances
 norm_cap: 2.0              # Cap parameter norms before exp_map
 
 # RoPE settings
-rope_max_seq_len: 4096
+rope_max_seq_len: 1024
 use_rope: true
 
 # =========================
@@ -90,7 +90,7 @@ hf_private: false
 # Weights & Biases
 wandb_mode: "online"        # online, offline, or disabled
 wandb_project: "fuseformer-babylm"
-wandb_entity: "bendemonium" # Your W&B username
+# wandb_entity: "bendemonium" # Your W&B username
 wandb_run_name: "fuseformer-v1"
 wandb_log_every: 10
 
@@ -108,6 +108,7 @@ log_hyperbolic_stats: true
 # Gradient monitoring
 log_grad_norms: true
 clip_grad_norm: true
+gradient_checkpointing: true
 
 # =========================
 # Experimental Settings

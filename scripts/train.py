@@ -176,6 +176,9 @@ def load_data(cfg: Dict, is_main: bool):
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+            
+        # Handle vocab size after potentially adding special tokens
+        original_vocab_size = len(tokenizer)
         
         # Load datasets
         train_dataset = load_tokenized_hf_dataset(
@@ -185,6 +188,19 @@ def load_data(cfg: Dict, is_main: bool):
             token=cfg.get("hf_token", os.environ.get("HF_TOKEN"))
         )
         
+        # Remove text fields, keep only tokenized data
+        columns_to_remove = []
+        if hasattr(train_dataset, 'column_names'):
+            # Keep only the columns we need for training
+            required_columns = {'input_ids', 'attention_mask'}
+            columns_to_remove = [col for col in train_dataset.column_names 
+                               if col not in required_columns]
+            
+            if columns_to_remove:
+                if is_main:
+                    logger.info(f"Removing unnecessary columns: {columns_to_remove}")
+                train_dataset = train_dataset.remove_columns(columns_to_remove)
+        
         dev_split = cfg.get("dev_split", "dev")
         try:
             dev_dataset = load_tokenized_hf_dataset(
@@ -193,6 +209,10 @@ def load_data(cfg: Dict, is_main: bool):
                 streaming=cfg.get("streaming", False),
                 token=cfg.get("hf_token", os.environ.get("HF_TOKEN"))
             )
+            # Remove unnecessary columns from dev set too
+            if columns_to_remove and hasattr(dev_dataset, 'remove_columns'):
+                dev_dataset = dev_dataset.remove_columns([col for col in columns_to_remove 
+                                                        if col in dev_dataset.column_names])
         except Exception as e:
             if is_main:
                 logger.warning(f"Could not load dev split '{dev_split}': {e}")
@@ -204,6 +224,10 @@ def load_data(cfg: Dict, is_main: bool):
                     streaming=cfg.get("streaming", False),
                     token=cfg.get("hf_token", os.environ.get("HF_TOKEN"))
                 )
+                # Remove unnecessary columns
+                if columns_to_remove and hasattr(dev_dataset, 'remove_columns'):
+                    dev_dataset = dev_dataset.remove_columns([col for col in columns_to_remove 
+                                                            if col in dev_dataset.column_names])
             except:
                 # Split train data 90/10
                 if hasattr(train_dataset, 'train_test_split'):
@@ -218,11 +242,18 @@ def load_data(cfg: Dict, is_main: bool):
             logger.info(f"📊 Analyzing dataset...")
             analyze_tokenized_dataset(train_dataset)
         
-        # Create data collator for MLM
+        # Create data collator for MLM (may add mask token)
         data_collator = create_data_collator(
             tokenizer, 
             mlm_probability=cfg.get("mlm_probability", 0.15)
         )
+        
+        # Update vocab size in config if tokenizer was extended
+        new_vocab_size = len(tokenizer)
+        if new_vocab_size != original_vocab_size:
+            if is_main:
+                logger.info(f"Vocab size updated: {original_vocab_size} → {new_vocab_size}")
+            cfg["vocab_size"] = new_vocab_size
         
         # Create DataLoaders
         train_loader = DataLoader(
@@ -525,7 +556,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-"""
-python scripts/train.py --model mixed --config configs/base.yaml
-"""

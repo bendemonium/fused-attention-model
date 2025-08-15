@@ -10,3 +10,4 @@ scipy
 wandb
 accelerate
 pyyaml
+datasets
