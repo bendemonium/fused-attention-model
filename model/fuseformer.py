@@ -10,7 +10,7 @@ from .more_model_utils import LayerNorm, FeedForward, make_padding_mask
 from .euclidean import MultiHeadAttentionEuclid as EuclidMHA
 from .hyperbolic import LorentzSelfAttention              # returns points when return_points=True
 from .fusion import FusionOnManifold                      # on-manifold barycentric fusion + log-map->D
-from .fuseformer_config import FuseFormerConfig           # NOTE: underscore in filename
+from .fuseformerconfig import FuseFormerConfig           # NOTE: underscore in filename
 
 class FuseFormerBlock(nn.Module):
     """
