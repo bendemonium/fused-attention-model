@@ -24,7 +24,7 @@ source bb-env/bin/activate
 ```
 
 ```
-pip install -r requirements.txt
+
 ```
 
 ```
@@ -32,9 +32,11 @@ sudo apt install -y software-properties-common
 sudo add-apt-repository -y ppa:deadsnakes/ppa
 sudo apt update
 sudo apt install -y python3.11 python3.11-venv python3.11-dev
-```
-```
 pip install --upgrade --index-url https://download.pytorch.org/whl/cu121 torch torchvision torchaudio
+pip install -r requirements.txt
+```
+```
+
 ```
 
 git stuff
