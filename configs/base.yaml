@@ -13,12 +13,12 @@ streaming: false
 # =========================
 # Model Architecture 
 # =========================
-# Core architecture
-vocab_size: 50257  # GPT-2 vocab size
-d_model: 256       # Hidden dimension
-num_heads: 8      # Attention heads  
-num_layers: 4     # Transformer layers
-d_ff: 256         # FFN dimension (4 * d_model)
+# Core architecture - REDUCED for memory and stability
+vocab_size: 50258     # GPT-2 vocab size + 1 for mask token
+d_model: 256          # REDUCED from 768 for memory
+num_heads: 4          # REDUCED from 12 for memory
+num_layers: 4         # REDUCED from 12 for memory
+d_ff: 512            # REDUCED (4 * d_model)
 max_position_embeddings: 1024
 
 # Regularization
@@ -30,32 +30,32 @@ max_grad_norm: 1.0
 # =========================
 # Hyperbolic-Specific Settings
 # =========================
-# Lorentz hyperboloid parameters
-lorentz_spatial_dim: 64    # Spatial dimension for hyperbolic space
-lorentz_tau: 0.1           # Temperature parameter (start low for stability)
+# Lorentz hyperboloid parameters - CONSERVATIVE
+lorentz_spatial_dim: 32    # REDUCED from 64 for memory
+lorentz_tau: 0.05          # LOWER for stability (was 0.1)
 karcher_steps: 1           # Steps for Karcher mean computation
 
-# Fusion parameters  
-alpha_warmup_steps: 1000   # Steps to warm up alpha from 0 to learned value
-fusion_init_alpha: 0.0    # Start with pure Euclidean (alpha=0)
+# Fusion parameters
+alpha_warmup_steps: 2000   # LONGER warmup (was 1000)
+fusion_init_alpha: 0.0     # Start with pure Euclidean (alpha=0)
 
-# Numerical stability
+# Numerical stability - AGGRESSIVE
 use_fp32_hyperbolic: true  # Keep hyperbolic ops in FP32
-distance_cap: 5.0          # Cap hyperbolic distances
-norm_cap: 2.0              # Cap parameter norms before exp_map
+distance_cap: 3.0          # LOWER cap (was 5.0)
+norm_cap: 1.5              # LOWER cap (was 2.0)
 
 # RoPE settings
-rope_max_seq_len: 1024
+rope_max_seq_len: 4096
 use_rope: true
 
 # =========================
 # Training Configuration
 # =========================
-# Basic training
-batch_size: 16             # Start smaller for stability
-eval_batch_size: 32
+# Basic training - MEMORY OPTIMIZED
+batch_size: 4              # DRASTICALLY REDUCED from 16
+eval_batch_size: 8         # REDUCED from 32
 epochs: 3
-num_workers: 4
+num_workers: 2             # REDUCED from 4
 
 # Learning rate and optimization
 lr: 3e-4
@@ -68,8 +68,9 @@ warmup_steps: 1000
 # MLM settings
 mlm_probability: 0.15
 
-# Mixed precision (careful with hyperbolic ops)
-amp_dtype: "fp16"          # Use fp16, but hyperbolic ops stay fp32
+# Mixed precision - DISABLED for stability
+amp_dtype: "fp32"          # CHANGED: No mixed precision at all
+gradient_checkpointing: true  # Enable to save memory
 
 # =========================
 # Checkpoint & Logging
@@ -77,7 +78,7 @@ amp_dtype: "fp16"          # Use fp16, but hyperbolic ops stay fp32
 output_dir: "./outputs/fuseformer_babylm"
 
 # Milestone saving (every N million words)
-milestones_words: ["1m", "2m", "5m", "10m", "20m", "50m", "100m"]
+milestones_words: ["1m", "2m", "5m", "10m", "20m", "30m", "40m", "50m", "60m", "70m", "80m", "90m", "100m"]
 push_every_milestone: true
 
 # HuggingFace Hub settings
@@ -91,7 +92,7 @@ hf_private: false
 wandb_mode: "online"        # online, offline, or disabled
 wandb_project: "fuseformer-babylm"
 # wandb_entity: "bendemonium" # Your W&B username
-wandb_run_name: "fuseformer-v1"
+wandb_run_name: "fuseformer-v2-stable"
 wandb_log_every: 10
 
 # =========================
@@ -108,7 +109,6 @@ log_hyperbolic_stats: true
 # Gradient monitoring
 log_grad_norms: true
 clip_grad_norm: true
-gradient_checkpointing: true
 
 # =========================
 # Experimental Settings
@@ -118,7 +118,10 @@ euclidean_only: false      # Set true to disable hyperbolic branch
 hyperbolic_only: false     # Set true to disable Euclidean branch
 progressive_fusion: true   # Gradually increase alpha during training
 
-# Advanced numerical stability
+# Advanced numerical stability - ENHANCED
 use_identity_attention_fallback: true  # For all-masked rows
 enable_attention_debugging: true       # Extra logging for attention issues
-safe_mode_steps: 100                  # Extra careful for first N steps
+safe_mode_steps: 2000                  # EXTENDED safe mode (was 100)
+
+# Memory optimization
+clear_cache_every_n_steps: 50          # Clear CUDA cache frequently
