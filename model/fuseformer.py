@@ -1,4 +1,5 @@
 # model/fuseformer.py
+
 from __future__ import annotations
 from typing import Optional, List, Tuple, Dict, Any
 
@@ -8,17 +9,18 @@ from transformers import PreTrainedModel
 
 from .more_model_utils import LayerNorm, FeedForward, make_padding_mask
 from .euclidean import MultiHeadAttentionEuclid as EuclidMHA
-from .hyperbolic import LorentzSelfAttention              # returns points when return_points=True
-from .fusion import FusionOnManifold                      # on-manifold barycentric fusion + log-map->D
-from .fuseformerconfig import FuseFormerConfig           # NOTE: underscore in filename
+from .hyperbolic import LorentzSelfAttention           # returns (B,T,A) when return_points=True
+from .fusion import FusionOnManifold                   # on-manifold fusion + log-map->D
+from .fuseformerconfig import FuseFormerConfig
+
 
 class FuseFormerBlock(nn.Module):
     """
     Pre-LN mixed-geometry block:
-      x -> LN -> [Euclid MHA (B,T,D), Hyperbolic MHA (B,T,A)] -> on-manifold fusion -> +res
+      x -> LN -> [Euclid MHA (B,T,D), Hyperbolic MHA -> (B,T,A)] -> on-manifold fusion -> +res
         -> LN -> FFN (Euclidean) -> +res
     Notes:
-      - Fusion module holds a per-block Lorentz anchor as a geoopt.ManifoldParameter.
+      - Fusion module holds a learnable anchor via Euclidean params (a, z) internally.
       - A = lorentz_spatial_dim + 1 (ambient).
     """
     def __init__(self, cfg: FuseFormerConfig):
@@ -30,26 +32,28 @@ class FuseFormerBlock(nn.Module):
 
         self.ln_attn = LayerNorm(D, eps=cfg.layer_norm_eps)
 
-        # Euclidean self-attention (returns tensor or (tensor, attn))
+        # Euclidean branch
         self.euclid_attn = EuclidMHA(
             d_model=D,
             num_heads=H,
             attn_dropout=cfg.attn_dropout,
+            proj_dropout=cfg.dropout,
         )
 
-        # Hyperbolic self-attention (can return manifold points for fusion)
+        # Hyperbolic branch (Lorentz model); returns manifold points for fusion
         self.hyp_attn = LorentzSelfAttention(
             d_model=D,
             num_heads=H,
             spatial_dim=n,
             tau=cfg.lorentz_tau,
             attn_dropout=cfg.attn_dropout,
+            proj_dropout=cfg.dropout,
             rope_max_seq_len=cfg.rope_max_seq_len,
+            use_rope=True,
             karcher_steps=cfg.karcher_steps,
-            pre_lift_scale=getattr(cfg, "pre_lift_scale", 1.0),
         )
 
-        # On-manifold fusion (owns a learned Lorentz anchor)
+        # On‑manifold fusion (does log/exp + geodesic step and returns ℝ^D)
         self.fuse = FusionOnManifold(
             d_model=D,
             ambient_dim=A,
@@ -64,33 +68,27 @@ class FuseFormerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,                    # (B,T,D)
-        attn_mask: Optional[torch.Tensor],  # (B,1,T,T) True=keep
+        attn_mask: Optional[torch.Tensor],  # (B,1,T,T)
         return_alpha: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         h = self.ln_attn(x)
 
-        # Euclidean branch
-        euclid_out = self.euclid_attn(h, mask=attn_mask)
-        if isinstance(euclid_out, tuple):
-            e_out, _ = euclid_out      # we don't use Euclid attn weights here
-        else:
-            e_out = euclid_out         # (B,T,D)
+        # Euclidean attention branch
+        eu_out = self.euclid_attn(h, mask=attn_mask)     # (B,T,D) or (B,T,D),attn
+        e_out = eu_out[0] if isinstance(eu_out, tuple) else eu_out
 
-        # Hyperbolic branch: get (B,T,A) manifold points, sharing fusion anchor
-        y_h = self.hyp_attn(
-            h,
-            anchor_p=self.fuse.anchor,    # keep tangent/anchor consistent with fusion
-            mask=attn_mask,
-            return_points=True
-        )  # (B,T,A)
+        # Hyperbolic attention branch → manifold points (B,T,A)
+        # anchor is handled inside FusionOnManifold; no need to pass it here
+        y_h = self.hyp_attn(h, mask=attn_mask, return_points=True)
 
-        # On-manifold fusion → Euclidean D
-        z_fused, alpha = self.fuse(e_out, y_h)  # (B,T,D), (B,T,1)
+        # Fuse on the manifold and go back to ℝ^D
+        z_fused, alpha = self.fuse(e_out, y_h)           # (B,T,D), (B,T,1)
         x = x + self.drop_resid(z_fused)
 
         # Euclidean FFN
         z = self.ffn(self.ln_ffn(x))
         x = x + self.drop_resid(z)
+
         return (x, alpha if return_alpha else None)
 
 
@@ -108,25 +106,30 @@ class FuseFormerEncoder(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,                       # (B,T)
-        attention_mask: Optional[torch.Tensor] = None, # (B,T) 1=real, 0=pad
+        input_ids: torch.Tensor,                 # (B,T)
+        attention_mask: Optional[torch.Tensor],  # (B,T) 1=real, 0=pad
         return_alphas: bool = False,
     ) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]]]:
-        x = self.embed_tokens(input_ids)          # (B,T,D)
+        x = self.embed_tokens(input_ids)                 # (B,T,D)
         x = self.dropout(x)
         mask = make_padding_mask(attention_mask) if attention_mask is not None else None
 
         alpha_logs: List[torch.Tensor] = []
         for blk in self.layers:
             x, alpha = blk(x, mask, return_alpha=return_alphas)
-            if return_alphas and alpha is not None:
-                alpha_logs.append(alpha)          # each (B,T,1)
+            if return_alphas:
+                alpha_logs.append(alpha)                 # each (B,T,1)
 
         x = self.ln_final(x)
         return x, (alpha_logs if return_alphas else None)
 
 
 class FuseFormerForMaskedLM(PreTrainedModel):
+    """
+    HuggingFace-style wrapper for MLM.
+    - ties input/output embeddings by default
+    - returns {"loss","logits", optional "alphas"}
+    """
     config_class = FuseFormerConfig
 
     def __init__(self, config: FuseFormerConfig):
@@ -136,30 +139,19 @@ class FuseFormerForMaskedLM(PreTrainedModel):
             self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.tie_weights()
 
-    # --- Embedding tying APIs expected by HF ---
-
+    # embedding tying helpers
     def get_input_embeddings(self) -> nn.Embedding:
         return self.encoder.embed_tokens
 
     def set_input_embeddings(self, value: nn.Embedding):
         self.encoder.embed_tokens = value
         if getattr(self.config, "tie_word_embeddings", True) and hasattr(self, "lm_head"):
-            # weight tying
             self.lm_head.weight = self.encoder.embed_tokens.weight
-
-    def get_output_embeddings(self):
-        return None if getattr(self.config, "tie_word_embeddings", True) else self.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        if not getattr(self.config, "tie_word_embeddings", True):
-            self.lm_head = new_embeddings
 
     def tie_weights(self):
         if getattr(self.config, "tie_word_embeddings", True):
             if hasattr(self, "lm_head"):
                 self.lm_head.weight = self.encoder.embed_tokens.weight
-
-    # --- Forward ---
 
     def forward(
         self,
@@ -171,13 +163,14 @@ class FuseFormerForMaskedLM(PreTrainedModel):
     ) -> Dict[str, torch.Tensor]:
         hidden, alphas = self.encoder(input_ids, attention_mask, return_alphas=output_alphas)
 
+        # output projection (tied or untied)
         if getattr(self.config, "tie_word_embeddings", True):
             logits = torch.matmul(hidden, self.encoder.embed_tokens.weight.t())  # (B,T,V)
         else:
             logits = self.lm_head(hidden)
 
         out: Dict[str, torch.Tensor] = {"logits": logits}
-        if output_alphas and alphas:
+        if output_alphas and alphas is not None:
             out["alphas"] = torch.stack(alphas, dim=0)  # (L,B,T,1)
 
         if labels is not None:

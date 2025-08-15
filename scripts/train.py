@@ -1,3 +1,4 @@
+# scripts/train.py
 from __future__ import annotations
 import os
 import math
@@ -11,8 +12,6 @@ from torch.utils.data import Dataset, DataLoader
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from transformers import get_scheduler
-
-import geoopt
 
 from model.fuseformerconfig import FuseFormerConfig
 from model.fuseformer import FuseFormerForMaskedLM
@@ -80,15 +79,21 @@ def apply_mlm_mask(batch: Dict[str, torch.Tensor], vocab_size: int, pad_id: int,
     input_ids = batch["input_ids"]
     attention_mask = batch["attention_mask"]
     labels = input_ids.clone()
+
     candidates = attention_mask.bool()
     prob = torch.full_like(input_ids, mlm_prob, dtype=torch.float32)
     masked = (torch.bernoulli(prob).bool() & candidates)
+
     labels[~masked] = -100
+
     replace = torch.bernoulli(torch.full_like(input_ids, 0.8, dtype=torch.float32)).bool() & masked
     input_ids[replace] = mask_id
+
     rnd = torch.bernoulli(torch.full_like(input_ids, 0.5, dtype=torch.float32)).bool() & masked & ~replace
-    rand_tok = torch.randint(0, vocab_size, input_ids.shape, dtype=torch.long, device=input_ids.device)
-    input_ids[rnd] = rand_tok[rnd]
+    if rnd.any():
+        rand_tok = torch.randint(0, vocab_size, input_ids.shape, dtype=torch.long, device=input_ids.device)
+        input_ids[rnd] = rand_tok[rnd]
+
     batch["input_ids"] = input_ids
     batch["labels"] = labels
     return batch
@@ -183,8 +188,7 @@ def main():
     train_examples = hf_download_and_load_pkl(dataset_repo, cfg["train_pkl"], revision=revision, token=hf_token_data)
     dev_examples = hf_download_and_load_pkl(dataset_repo, cfg["dev_pkl"], revision=revision, token=hf_token_data)
     if is_main:
-        logger.info(f"Loaded from HF dataset repo '{dataset_repo}': "
-                    f"train={len(train_examples)} rows, dev={len(dev_examples)} rows")
+        logger.info(f"Loaded from HF dataset repo '{dataset_repo}': train={len(train_examples)} rows, dev={len(dev_examples)} rows")
 
     pad_id = int(cfg.get("pad_token_id", 0))
     mask_id = int(cfg.get("mask_token_id", 103))
@@ -195,8 +199,8 @@ def main():
     dev_ds = TokenizedListDataset(dev_examples, pad_token_id=pad_id)
     collate_fn = collate_builder(pad_id, vocab_size, mask_id, mlm_prob)
 
-    train_loader = DataLoader(train_ds, batch_size=int(cfg.get("batch_size", 32)), shuffle=True, num_workers=2, collate_fn=collate_fn)
-    dev_loader = DataLoader(dev_ds, batch_size=int(cfg.get("eval_batch_size", cfg.get("batch_size", 32))), shuffle=False, num_workers=int(cfg.get("num_workers", 0)), collate_fn=collate_fn)
+    train_loader = DataLoader(train_ds, batch_size=int(cfg.get("batch_size", 32)), shuffle=True, num_workers=int(cfg.get("num_workers", 2)), collate_fn=collate_fn)
+    dev_loader = DataLoader(dev_ds, batch_size=int(cfg.get("eval_batch_size", cfg.get("batch_size", 32))), shuffle=False, num_workers=int(cfg.get("num_workers", 2)), collate_fn=collate_fn)
 
     # ----- Model -----
     if args.model == "mixed":
@@ -209,7 +213,7 @@ def main():
         model = HyperbolicForMLM(cfg); mixed_hf = False
 
     # ----- Optimizers -----
-    euclid_params, anchor_params = split_params_euclid_vs_anchors(model)
+    euclid_params, anchor_params = split_params_euclid_vs_anchors(model)  # anchor_params will be [] in euclid-param variant
     optim_euclid = torch.optim.AdamW(
         euclid_params,
         lr=float(cfg.get("lr", 3e-4)),
@@ -217,11 +221,11 @@ def main():
         betas=tuple(cfg.get("adam_betas", (0.9, 0.999))),
         eps=float(cfg.get("adam_eps", 1e-8)),
     )
-    optim_anchor = geoopt.optim.RiemannianAdam(anchor_params, lr=float(cfg.get("lr_anchors", cfg.get("lr", 3e-4)))) if anchor_params else None
+    optim_anchor = None  # No Riemannian optimizer in euclidean-param variant
 
     # ----- Scheduler -----
     epochs = int(cfg.get("epochs", 3))
-    num_update_steps_per_epoch = math.ceil(len(train_loader) / accelerator.num_processes)
+    num_update_steps_per_epoch = math.ceil(len(train_loader) / max(1, accelerator.num_processes))
     total_training_steps = epochs * num_update_steps_per_epoch
     scheduler = get_scheduler(
         cfg.get("lr_scheduler", "linear"),
@@ -231,14 +235,9 @@ def main():
     )
 
     # ----- Prepare with accelerate -----
-    if optim_anchor is not None:
-        model, optim_euclid, optim_anchor, train_loader, dev_loader, scheduler = accelerator.prepare(
-            model, optim_euclid, optim_anchor, train_loader, dev_loader, scheduler
-        )
-    else:
-        model, optim_euclid, train_loader, dev_loader, scheduler = accelerator.prepare(
-            model, optim_euclid, train_loader, dev_loader, scheduler
-        )
+    model, optim_euclid, train_loader, dev_loader, scheduler = accelerator.prepare(
+        model, optim_euclid, train_loader, dev_loader, scheduler
+    )
 
     # ----- Milestones, bf16 preference -----
     milestones = MilestoneManager(cfg, output_dir)
@@ -248,7 +247,6 @@ def main():
     push_enabled = bool(cfg.get("push_every_milestone", True)) and "hf_repo" in cfg
 
     # ----- Training -----
-    best_dev = float("inf")
     for epoch in range(epochs):
         model.train()
         if is_main:
@@ -263,15 +261,12 @@ def main():
                 labels = batch["labels"]
 
                 # Finite logits guard
-                finite = torch.isfinite(logits).all()
-                if not finite.item():
+                if not torch.isfinite(logits).all().item():
                     if is_main and (step % 50 == 0):
                         lmin = logits.detach().float().amin().item()
                         lmax = logits.detach().float().amax().item()
                         logger.warning(f"[step {step}] non-finite logits: min={lmin:.3e} max={lmax:.3e}; skipping step.")
                     optim_euclid.zero_grad(set_to_none=True)
-                    if optim_anchor is not None:
-                        optim_anchor.zero_grad(set_to_none=True)
                     continue
 
                 valid_mask = (labels != -100)
@@ -281,14 +276,12 @@ def main():
                 if n_valid.item() == 0:
                     if is_main and (step % 50 == 0):
                         logger.warning(f"[step {step}] 0 valid targets in batch; skipping backward.")
-                    # (Optionally still update progress/words below; no optimizer step.)
                     continue
 
                 vocab = logits.size(-1)
                 loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction="sum")
                 loss_sum = loss_fct(logits.view(-1, vocab), labels.view(-1))
                 loss = loss_sum / n_valid
-                loss = outputs["loss"] if isinstance(outputs, dict) else outputs.loss
 
             accelerator.backward(loss)
             if accelerator.sync_gradients:
@@ -297,9 +290,6 @@ def main():
             optim_euclid.step()
             scheduler.step()
             optim_euclid.zero_grad(set_to_none=True)
-            if optim_anchor is not None:
-                optim_anchor.step()
-                optim_anchor.zero_grad(set_to_none=True)
 
             # Count words (ignoring pads)
             tokens_step = nonpad_token_count(batch["attention_mask"])
@@ -310,7 +300,6 @@ def main():
             if is_main:
                 next_target = milestones.next_target()
                 pbar.update(1, milestones.state.words_total, next_target, float(loss.item()))
-                # W&B logging
                 if cfg.get("wandb_mode", "online") != "disabled" and (milestones.state.global_step % int(cfg.get("wandb_log_every", 10)) == 0):
                     import wandb
                     wandb.log({
@@ -329,7 +318,6 @@ def main():
                     milestones.save()
                     save_local_checkpoint(accelerator.unwrap_model(model), cfg, Path(args.config), ckpt_dir, mixed_hf=(args.model=="mixed"))
                     snapshot_modeling_files(Path("."), ckpt_dir / "models")
-                    # optional tokenizer files
                     tok_dir = cfg.get("tokenizer_dir", None)
                     if tok_dir:
                         dst = ckpt_dir / "tokenizer"
@@ -340,7 +328,7 @@ def main():
                     try:
                         ensure_repo_and_push(
                             local_dir=ckpt_dir,
-                            repo_id=cfg["hf_repo"],  # MODEL REPO
+                            repo_id=cfg["hf_repo"],
                             branch=branch,
                             hf_token=cfg.get("hf_token", os.environ.get("HF_TOKEN")),
                             create_ok=bool(cfg.get("hf_create_repo", True)),
@@ -366,23 +354,21 @@ def main():
                 logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
                 labels = batch["labels"]
 
-                # Sum-reduction CE over valid targets
                 vocab = logits.size(-1)
                 loss_sum = nn.CrossEntropyLoss(ignore_index=-100, reduction="sum")(
                     logits.view(-1, vocab), labels.view(-1)
                 )
 
-                # Accumulate across processes
                 n = (labels != -100).sum()
                 total_loss += accelerator.gather_for_metrics(loss_sum.detach()).sum().item()
                 total_tokens += accelerator.gather_for_metrics(n.detach()).sum().item()
+
         dev_loss = total_loss / max(1, total_tokens)
         if is_main:
             logger.info(f"Eval loss/token: {dev_loss:.4f}")
             if cfg.get("wandb_mode", "online") != "disabled":
                 import wandb
                 wandb.log({"eval/loss": dev_loss}, step=milestones.state.global_step)
-            # save "best" locally
             milestones.save()
             best_dir = output_dir / "best"
             save_local_checkpoint(accelerator.unwrap_model(model), cfg, Path(args.config), best_dir, mixed_hf=(args.model=="mixed"))
@@ -414,5 +400,4 @@ def main():
 
 
 if __name__ == "__main__":
-    from accelerate import Accelerator
     main()

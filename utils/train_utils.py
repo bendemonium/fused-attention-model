@@ -1,3 +1,5 @@
+# utils/train_utils.py
+
 from __future__ import annotations
 import os
 import re
@@ -14,16 +16,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import yaml
 import torch
 import numpy as np
-import geoopt
 from tqdm.auto import tqdm
-
-# HF Hub
 from huggingface_hub import HfApi, create_repo, upload_folder, hf_hub_download
 
 
-# ---------------------------
-# Config / YAML
-# ---------------------------
+# =========================
+# YAML / Config
+# =========================
 
 def load_yaml_cfg(path: str) -> Dict[str, Any]:
     with open(path, "r") as f:
@@ -33,9 +32,9 @@ def load_yaml_cfg(path: str) -> Dict[str, Any]:
     return cfg
 
 
-# ---------------------------
-# WandB
-# ---------------------------
+# =========================
+# Weights & Biases
+# =========================
 
 def setup_wandb(cfg: Dict[str, Any]) -> Optional[Any]:
     mode = cfg.get("wandb_mode", "online")  # "online" | "offline" | "disabled"
@@ -54,16 +53,16 @@ def setup_wandb(cfg: Dict[str, Any]) -> Optional[Any]:
     return wandb
 
 
-# ---------------------------
-# HF dataset repo → pickled splits
-# ---------------------------
+# =========================
+# HF dataset repo -> pickled splits
+# =========================
 
 def _to_list_of_dicts(obj: Any) -> List[Dict[str, Any]]:
     # HF Dataset-like
     if hasattr(obj, "column_names") and hasattr(obj, "__len__") and hasattr(obj, "__getitem__"):
         return [obj[i] for i in range(len(obj))]
 
-    # DatasetDict → pick a split (prefer "train")
+    # DatasetDict -> take "train" if present, else first split
     if isinstance(obj, dict) and obj and any(hasattr(v, "column_names") for v in obj.values()):
         split = obj.get("train") or next(iter(obj.values()))
         return [split[i] for i in range(len(split))]
@@ -77,7 +76,7 @@ def _to_list_of_dicts(obj: Any) -> List[Dict[str, Any]]:
         keys = list(obj.keys()); n = len(obj[keys[0]])
         return [{k: obj[k][i] for k in keys} for i in range(n)]
 
-    # dict of tensors/ndarrays -> row-wise dicts
+    # dict of tensors/arrays -> row dicts
     if isinstance(obj, dict) and obj and all(hasattr(v, "shape") for v in obj.values()):
         keys = list(obj.keys())
         n = int(next(iter(obj.values())).shape[0])
@@ -87,8 +86,10 @@ def _to_list_of_dicts(obj: Any) -> List[Dict[str, Any]]:
             for k, v in obj.items():
                 vi = v[i]
                 if isinstance(vi, np.ndarray):
-                    # convert to torch.LongTensor row-by-row to avoid huge copies
-                    vi = torch.from_numpy(vi).long() if vi.dtype.kind in "iu" else torch.from_numpy(vi)
+                    if vi.dtype.kind in "iu":
+                        vi = torch.from_numpy(vi).long()
+                    else:
+                        vi = torch.from_numpy(vi)
                 elif isinstance(vi, torch.Tensor) and vi.dtype not in (torch.long, torch.int64):
                     vi = vi.long()
                 d[k] = vi
@@ -102,12 +103,14 @@ def _to_list_of_dicts(obj: Any) -> List[Dict[str, Any]]:
         out = []
         for i in range(n):
             d = {"input_ids": torch.as_tensor(ids[i]).long()}
-            if am is not None:  d["attention_mask"] = torch.as_tensor(am[i]).long()
-            if lab is not None: d["labels"] = torch.as_tensor(lab[i]).long()
+            if am is not None:
+                d["attention_mask"] = torch.as_tensor(am[i]).long()
+            if lab is not None:
+                d["labels"] = torch.as_tensor(lab[i]).long()
             out.append(d)
         return out
 
-    # Fallback: generic indexable object yielding dicts
+    # Generic indexable yielding dicts
     if hasattr(obj, "__len__") and hasattr(obj, "__getitem__"):
         try:
             first = obj[0]
@@ -119,8 +122,19 @@ def _to_list_of_dicts(obj: Any) -> List[Dict[str, Any]]:
     raise ValueError("Unsupported pickled dataset format after robust conversion.")
 
 
-def hf_download_and_load_pkl(repo_id: str, filename: str, revision: Optional[str] = None, token: Optional[str] = None) -> List[Dict[str, Any]]:
-    local_path = hf_hub_download(repo_id=repo_id, filename=filename, revision=revision, token=token, repo_type="dataset")
+def hf_download_and_load_pkl(
+    repo_id: str,
+    filename: str,
+    revision: Optional[str] = None,
+    token: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    local_path = hf_hub_download(
+        repo_id=repo_id,
+        filename=filename,
+        revision=revision,
+        token=token,
+        repo_type="dataset",
+    )
     with open(local_path, "rb") as f:
         obj = pickle.load(f)
     data = _to_list_of_dicts(obj)
@@ -129,9 +143,9 @@ def hf_download_and_load_pkl(repo_id: str, filename: str, revision: Optional[str
     return data
 
 
-# ---------------------------
+# =========================
 # Tokens -> Words counter
-# ---------------------------
+# =========================
 
 @dataclass
 class ProgressState:
@@ -169,9 +183,9 @@ def nonpad_token_count(attention_mask: torch.Tensor) -> int:
     return int(attention_mask.sum().item())
 
 
-# ---------------------------
+# =========================
 # Milestones
-# ---------------------------
+# =========================
 
 def parse_word_tag(tag: str) -> int:
     """'1m' -> 1_000_000, '20m' -> 20_000_000, '100m' -> 100_000_000."""
@@ -203,6 +217,7 @@ class MilestoneManager:
 
     def update_counters(self, tokens_step_global: int):
         self.state.tokens_total += tokens_step_global
+        # rough rule-of-thumb: 0.75 words/token for English-ish corpora
         self.state.words_total = 0.75 * self.state.tokens_total
 
     def mark_done(self, target_words: int):
@@ -217,9 +232,9 @@ class MilestoneManager:
         self.progress_path.write_text(json.dumps(self.state.to_dict(), indent=2))
 
 
-# ---------------------------
+# =========================
 # HF Hub utilities (MODEL REPO pushes)
-# ---------------------------
+# =========================
 
 def ensure_repo_and_push(
     local_dir: Path,
@@ -246,14 +261,19 @@ def ensure_repo_and_push(
 
 
 def snapshot_modeling_files(project_root: Path, dest_dir: Path):
+    """
+    Copies the key modeling files into `dest_dir` for reproducibility.
+    NOTE: directory is `model/` (singular) in this project.
+    """
     dest_dir.mkdir(parents=True, exist_ok=True)
     model_files = [
-        "models/fuseformer.py",
-        "models/fuseformer_config.py",
-        "models/euclidean.py",
-        "models/hyperbolic.py",
-        "models/fusion.py",
-        "models/more_model_utils.py",
+        "model/fuseformer.py",
+        "model/fuseformerconfig.py",
+        "model/euclidean.py",
+        "model/hyperbolic.py",
+        "model/hyperplanes.py",
+        "model/fusion.py",
+        "model/more_model_utils.py",
     ]
     for rel in model_files:
         src = project_root / rel
@@ -271,7 +291,7 @@ def save_local_checkpoint(
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "configs").mkdir(exist_ok=True, parents=True)
     shutil.copyfile(cfg_path, out_dir / "configs" / "train_config.yaml")
-    # save
+    # save weights
     if mixed_hf and hasattr(model, "save_pretrained"):
         model.save_pretrained(str(out_dir), safe_serialization=True)
     else:
@@ -280,23 +300,29 @@ def save_local_checkpoint(
             json.dump(cfg, f, indent=2)
 
 
-# ---------------------------
-# Optimizers
-# ---------------------------
+# =========================
+# Optimizer param splitter
+# (no geoopt anchors in euclidean-param version)
+# =========================
 
-def split_params_euclid_vs_anchors(model) -> Tuple[List[torch.nn.Parameter], List[geoopt.ManifoldParameter]]:
-    euclid, anchors = [], []
+def split_params_euclid_vs_anchors(model) -> Tuple[List[torch.nn.Parameter], List[torch.nn.Parameter]]:
+    """
+    In the euclidean-parameterized variant we do not use geoopt.ManifoldParameter.
+    Return all params as Euclidean; keep anchors list empty so training code
+    can skip the Riemannian optimizer branch cleanly.
+    """
+    euclid: List[torch.nn.Parameter] = []
+    anchors: List[torch.nn.Parameter] = []
     for p in model.parameters():
-        if isinstance(p, geoopt.ManifoldParameter):
-            anchors.append(p)
-        else:
-            euclid.append(p)
+        # If you decide to tag anchor params, you could check p.requires_grad and a name
+        # pattern here and append to `anchors`. For now: everything in `euclid`.
+        euclid.append(p)
     return euclid, anchors
 
 
-# ---------------------------
-# Progress bar (tqdm)
-# ---------------------------
+# =========================
+# Pretty progress bar
+# =========================
 
 class ProgressMeter:
     def __init__(self, total_steps: int, desc: str = ""):
@@ -335,10 +361,11 @@ class ProgressMeter:
         self.bar.close()
 
 
-# ---------------------------
-# AMP preference (GH200 etc.)
-# ---------------------------
+# =========================
+# AMP preference (Hopper/Ampere)
+# =========================
 
 def prefer_bf16() -> bool:
     cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
-    return cap[0] >= 8  # Ampere/Hopper default to bf16
+    # Ampere (8.x) or newer: prefer bf16
+    return cap[0] >= 8
