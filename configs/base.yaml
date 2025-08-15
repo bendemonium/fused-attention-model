@@ -18,8 +18,8 @@ vocab_size: 50258     # GPT-2 vocab size + 1 for mask token
 d_model: 256          # REDUCED from 768 for memory
 num_heads: 4          # REDUCED from 12 for memory
 num_layers: 4         # REDUCED from 12 for memory
-d_ff: 512            # REDUCED (4 * d_model)
-max_position_embeddings: 1024
+d_ff: 256            # REDUCED (4 * d_model)
+max_position_embeddings: 256
 
 # Regularization
 dropout: 0.1
@@ -52,7 +52,7 @@ use_rope: true
 # Training Configuration
 # =========================
 # Basic training - MEMORY OPTIMIZED
-batch_size: 4              # DRASTICALLY REDUCED from 16
+batch_size: 32              # DRASTICALLY REDUCED from 16
 eval_batch_size: 8         # REDUCED from 32
 epochs: 3
 num_workers: 2             # REDUCED from 4
