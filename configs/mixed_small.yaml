@@ -1,0 +1,79 @@
+dataset_name: "bendemonium/babylm25_tokens"
+tokenizer_name: "gpt2"
+train_split: "train"
+dev_split: "dev"
+streaming: false
+
+# Model architecture - SMALL MIXED
+vocab_size: 50258
+d_model: 384
+num_heads: 6
+num_layers: 4
+d_ff: 1536
+max_position_embeddings: 1024
+dropout: 0.1
+attn_dropout: 0.1
+layer_norm_eps: 1e-5
+max_grad_norm: 1.0
+
+# Hyperbolic settings - CONSERVATIVE
+lorentz_spatial_dim: 32
+lorentz_tau: 0.1
+karcher_steps: 1
+alpha_warmup_steps: 1000
+fusion_init_alpha: 0.0
+use_fp32_hyperbolic: true
+distance_cap: 5.0
+norm_cap: 2.0
+rope_max_seq_len: 2048
+use_rope: true
+
+# Training - 4x H100 optimized
+batch_size: 128
+eval_batch_size: 256
+epochs: 1
+num_workers: 32
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 8
+max_length: 128
+
+# Optimization
+lr: 6e-4
+weight_decay: 0.01
+adam_betas: [0.9, 0.999]
+adam_eps: 1e-8
+lr_scheduler: "cosine"
+warmup_steps: 500
+mlm_probability: 0.15
+amp_dtype: "fp32"
+gradient_checkpointing: false
+
+# Checkpointing
+output_dir: "./outputs/mixed_small"
+milestones_words: ["1m", "5m", "10m", "20m"]
+push_every_milestone: true
+hf_repo: "bendemonium/mixed-small-babylm"
+hf_branch_prefix: "words-"
+hf_create_repo: true
+hf_private: false
+
+# W&B
+wandb_mode: "online"
+wandb_project: "fuseformer-babylm-emnlp"
+wandb_run_name: "mixed-small-4gpu"
+wandb_log_every: 25
+
+# Stability
+eval_every_steps: 1000
+abort_on_nan_step_0: true
+log_attention_stats: false
+log_hyperbolic_stats: false
+log_grad_norms: false
+clip_grad_norm: true
+use_identity_attention_fallback: true
+enable_attention_debugging: false
+safe_mode_steps: 1000
+
+# Compilation
+compile_model: true

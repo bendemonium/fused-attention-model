@@ -1,0 +1,79 @@
+dataset_name: "bendemonium/babylm25_tokens"
+tokenizer_name: "gpt2"
+train_split: "train"
+dev_split: "dev"
+streaming: false
+
+# Model architecture - FULL MIXED
+vocab_size: 50258
+d_model: 768
+num_heads: 12
+num_layers: 12
+d_ff: 3072
+max_position_embeddings: 1024
+dropout: 0.1
+attn_dropout: 0.1
+layer_norm_eps: 1e-5
+max_grad_norm: 1.0
+
+# Hyperbolic settings - FULL STRENGTH
+lorentz_spatial_dim: 64
+lorentz_tau: 0.1
+karcher_steps: 1
+alpha_warmup_steps: 2000
+fusion_init_alpha: 0.0
+use_fp32_hyperbolic: true
+distance_cap: 5.0
+norm_cap: 2.0
+rope_max_seq_len: 2048
+use_rope: true
+
+# Training - 4x H100 optimized but larger model
+batch_size: 64        # Smaller batch for larger model
+eval_batch_size: 128
+epochs: 3            # Full training
+num_workers: 32
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 8
+max_length: 256      # Longer sequences
+
+# Optimization
+lr: 3e-4            # Lower LR for larger model
+weight_decay: 0.01
+adam_betas: [0.9, 0.999]
+adam_eps: 1e-8
+lr_scheduler: "cosine"
+warmup_steps: 1000
+mlm_probability: 0.15
+amp_dtype: "fp32"
+gradient_checkpointing: true  # Enable for memory
+
+# Checkpointing - COMPREHENSIVE
+output_dir: "./outputs/mixed_full"
+milestones_words: ["1m", "2m", "5m", "10m", "20m", "50m", "100m"]
+push_every_milestone: true
+hf_repo: "bendemonium/fuseformer-full-babylm"
+hf_branch_prefix: "words-"
+hf_create_repo: true
+hf_private: false
+
+# W&B
+wandb_mode: "online"
+wandb_project: "fuseformer-babylm-emnlp"
+wandb_run_name: "mixed-full-4gpu"
+wandb_log_every: 50
+
+# Enhanced monitoring
+eval_every_steps: 1000
+abort_on_nan_step_0: true
+log_attention_stats: true
+log_hyperbolic_stats: true
+log_grad_norms: true
+clip_grad_norm: true
+use_identity_attention_fallback: true
+enable_attention_debugging: true
+safe_mode_steps: 2000
+
+# Compilation
+compile_model: true

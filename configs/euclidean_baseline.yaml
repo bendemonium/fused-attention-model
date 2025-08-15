@@ -1,0 +1,64 @@
+dataset_name: "bendemonium/babylm25_tokens"
+tokenizer_name: "gpt2"
+train_split: "train"
+dev_split: "dev"
+streaming: false
+
+# Model architecture - SMALL BASELINE
+vocab_size: 50258
+d_model: 512
+num_heads: 8
+num_layers: 6
+d_ff: 2048
+max_position_embeddings: 1024
+dropout: 0.1
+attn_dropout: 0.1
+layer_norm_eps: 1e-5
+max_grad_norm: 1.0
+
+# Training - 4x H100 optimized
+batch_size: 128
+eval_batch_size: 256
+epochs: 1
+num_workers: 32
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 8
+max_length: 128
+
+# Optimization
+lr: 6e-4
+weight_decay: 0.01
+adam_betas: [0.9, 0.999]
+adam_eps: 1e-8
+lr_scheduler: "cosine"
+warmup_steps: 500
+mlm_probability: 0.15
+amp_dtype: "fp32"
+gradient_checkpointing: false
+
+# Checkpointing
+output_dir: "./outputs/euclidean_baseline"
+milestones_words: ["1m", "5m", "10m", "20m"]
+push_every_milestone: true
+hf_repo: "bendemonium/euclidean-baseline-babylm"
+hf_branch_prefix: "words-"
+hf_create_repo: true
+hf_private: false
+
+# W&B
+wandb_mode: "online"
+wandb_project: "fuseformer-babylm-emnlp"
+wandb_run_name: "euclidean-baseline-small-4gpu"
+wandb_log_every: 25
+
+# Minimal debugging for speed
+eval_every_steps: 1000
+abort_on_nan_step_0: true
+log_attention_stats: false
+log_hyperbolic_stats: false
+log_grad_norms: false
+clip_grad_norm: true
+
+# Compilation
+compile_model: true

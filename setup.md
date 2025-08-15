@@ -54,6 +54,7 @@ sudo apt install git-lfs
 git lfs install
 git lfs track "*.safetensors"
 git add .gitattributes
+export PYTHONPATH=/home/ubuntu/fused-attention-model
 ```
 
 hf login 

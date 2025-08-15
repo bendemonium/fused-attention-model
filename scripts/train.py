@@ -245,7 +245,8 @@ def load_data(cfg: Dict, is_main: bool):
         # Create data collator for MLM (may add mask token)
         data_collator = create_data_collator(
             tokenizer, 
-            mlm_probability=cfg.get("mlm_probability", 0.15)
+            mlm_probability=cfg.get("mlm_probability", 0.15),
+            max_length=cfg.get("max_length", None)
         )
         
         # Update vocab size in config if tokenizer was extended
@@ -255,14 +256,17 @@ def load_data(cfg: Dict, is_main: bool):
                 logger.info(f"Vocab size updated: {original_vocab_size} → {new_vocab_size}")
             cfg["vocab_size"] = new_vocab_size
         
-        # Create DataLoaders
+        # Create DataLoaders with all optimizations
         train_loader = DataLoader(
             train_dataset,
             batch_size=cfg.get("batch_size", 32),
             shuffle=not cfg.get("streaming", False),  # No shuffle for streaming
             num_workers=cfg.get("num_workers", 2),
             collate_fn=data_collator,
-            pin_memory=True
+            pin_memory=cfg.get("pin_memory", True),
+            persistent_workers=cfg.get("persistent_workers", False),
+            prefetch_factor=cfg.get("prefetch_factor", 2),
+            drop_last=cfg.get("dataloader_drop_last", False)
         )
         
         dev_loader = DataLoader(
@@ -271,7 +275,9 @@ def load_data(cfg: Dict, is_main: bool):
             shuffle=False,
             num_workers=cfg.get("num_workers", 2),
             collate_fn=data_collator,
-            pin_memory=True
+            pin_memory=cfg.get("pin_memory", True),
+            persistent_workers=cfg.get("persistent_workers", False),
+            prefetch_factor=cfg.get("prefetch_factor", 2)
         )
         
         return train_loader, dev_loader, tokenizer
@@ -342,6 +348,20 @@ def main():
     else:
         model = HyperbolicForMLM(cfg); mixed_hf = False
 
+    # Add torch compilation if requested
+    if cfg.get("compile_model", False) and hasattr(torch, 'compile'):
+        if is_main:
+            logger.info("🔥 Compiling model for speed...")
+        model = torch.compile(model, mode="reduce-overhead")
+        if is_main:
+            logger.info("✅ Model compiled successfully")
+    
+    # Enable gradient checkpointing if requested
+    if cfg.get("gradient_checkpointing", False) and hasattr(model, 'gradient_checkpointing_enable'):
+        model.gradient_checkpointing_enable()
+        if is_main:
+            logger.info("✅ Gradient checkpointing enabled")
+
     # ----- Optimizers -----
     euclid_params, anchor_params = split_params_euclid_vs_anchors(model)  # anchor_params will be [] in euclid-param variant
     optim_euclid = torch.optim.AdamW(
@@ -390,45 +410,62 @@ def main():
             amp_dtype = torch.bfloat16 if (device_type == "cuda" and use_bf16) else torch.float16
             
             # Use safe forward step for numerical stability
-            with torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=(device_type == "cuda")):
-                outputs = safe_forward_step(model, batch, milestones.state.global_step, amp_enabled=(device_type == "cuda"))
-                logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
-                labels = batch["labels"]
+            try:
+                with torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=(device_type == "cuda")):
+                    outputs = safe_forward_step(model, batch, milestones.state.global_step, amp_enabled=(device_type == "cuda"))
+                    logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
+                    labels = batch["labels"]
 
-                # Enhanced finite logits guard
-                if not torch.isfinite(logits).all().item():
-                    if is_main:
-                        lmin = logits.detach().float().amin().item()
-                        lmax = logits.detach().float().amax().item()
-                        nan_count = torch.isnan(logits).sum().item()
-                        inf_count = torch.isinf(logits).sum().item()
-                        logger.error(f"❌ [step {milestones.state.global_step}] Non-finite logits detected!")
-                        logger.error(f"   Min: {lmin:.3e}, Max: {lmax:.3e}")
-                        logger.error(f"   NaN count: {nan_count}, Inf count: {inf_count}")
-                        logger.error(f"   Batch shape: {logits.shape}")
+                    # Enhanced finite logits guard
+                    if not torch.isfinite(logits).all().item():
+                        if is_main:
+                            lmin = logits.detach().float().amin().item()
+                            lmax = logits.detach().float().amax().item()
+                            nan_count = torch.isnan(logits).sum().item()
+                            inf_count = torch.isinf(logits).sum().item()
+                            logger.error(f"❌ [step {milestones.state.global_step}] Non-finite logits detected!")
+                            logger.error(f"   Min: {lmin:.3e}, Max: {lmax:.3e}")
+                            logger.error(f"   NaN count: {nan_count}, Inf count: {inf_count}")
+                            logger.error(f"   Batch shape: {logits.shape}")
+                            
+                            # For your NaN debugging - this is where you'd add breakpoint
+                            if milestones.state.global_step < 20:  # Early NaN detection
+                                logger.error("🚨 EARLY NaN DETECTED - This is likely the masking issue!")
+                                # Uncomment for debugging:
+                                # import pdb; pdb.set_trace()
                         
-                        # For your NaN debugging - this is where you'd add breakpoint
-                        if milestones.state.global_step < 20:  # Early NaN detection
-                            logger.error("🚨 EARLY NaN DETECTED - This is likely the masking issue!")
-                            # Uncomment for debugging:
-                            # import pdb; pdb.set_trace()
-                    
-                    optim_euclid.zero_grad(set_to_none=True)
-                    continue
+                        # Clean up memory before continuing
+                        del outputs, logits
+                        torch.cuda.empty_cache()
+                        optim_euclid.zero_grad(set_to_none=True)
+                        continue
 
-                valid_mask = (labels != -100)
-                n_valid = valid_mask.sum()
+                    valid_mask = (labels != -100)
+                    n_valid = valid_mask.sum()
 
-                # Empty target guard (common MLM pitfall)
-                if n_valid.item() == 0:
-                    if is_main and (milestones.state.global_step % 50 == 0):
-                        logger.warning(f"[step {milestones.state.global_step}] 0 valid targets in batch; skipping backward.")
-                    continue
+                    # Empty target guard (common MLM pitfall)
+                    if n_valid.item() == 0:
+                        if is_main and (milestones.state.global_step % 50 == 0):
+                            logger.warning(f"[step {milestones.state.global_step}] 0 valid targets in batch; skipping backward.")
+                        continue
 
-                vocab = logits.size(-1)
-                loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction="sum")
-                loss_sum = loss_fct(logits.view(-1, vocab), labels.view(-1))
-                loss = loss_sum / n_valid
+                    vocab = logits.size(-1)
+                    loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction="sum")
+                    loss_sum = loss_fct(logits.view(-1, vocab), labels.view(-1))
+                    loss = loss_sum / n_valid
+            
+            except torch.cuda.OutOfMemoryError as e:
+                if is_main:
+                    logger.error(f"🚨 CUDA OOM at step {milestones.state.global_step}")
+                    logger.error(f"Batch shape: {batch['input_ids'].shape}")
+                    logger.error(f"GPU memory: {torch.cuda.memory_allocated() / 1e9:.2f}GB allocated")
+                
+                # Emergency cleanup
+                torch.cuda.empty_cache()
+                optim_euclid.zero_grad(set_to_none=True)
+                
+                # Skip this batch and continue
+                continue
 
             accelerator.backward(loss)
             if accelerator.sync_gradients:
@@ -458,10 +495,17 @@ def main():
                     }, step=milestones.state.global_step)
 
                 # Milestone checkpoint & push to MODEL REPO
+                if is_main:  # Add debugging
+                    print(f"🔍 Debug: push_enabled={push_enabled}, next_target={next_target}, words_total={milestones.state.words_total}")
+                    if next_target is not None:
+                        print(f"🔍 Debug: words_total >= next_target? {milestones.state.words_total >= next_target}")
+                
                 if push_enabled and (next_target is not None) and (milestones.state.words_total >= next_target):
                     tag = f"{next_target//1_000_000:03d}m"
                     branch = f"{cfg.get('hf_branch_prefix','words-')}{tag}"
                     ckpt_dir = output_dir / f"checkpoint-{tag}"
+                    if is_main:
+                        print(f"🚀 Starting push for {tag} words to branch {branch}")
                     milestones.save()
                     save_local_checkpoint(accelerator.unwrap_model(model), cfg, Path(args.config), ckpt_dir, mixed_hf=(args.model=="mixed"))
                     snapshot_modeling_files(Path("."), ckpt_dir / "models")
@@ -481,6 +525,11 @@ def main():
                                     shutil.copyfile(p, dst / p.name)
                     
                     try:
+                        if is_main:
+                            print(f"🔄 Pushing to HF Hub: {cfg['hf_repo']} branch {branch}")
+                            print(f"📁 Local dir: {ckpt_dir}")
+                            print(f"🏷️  Branch: {branch}")
+                        
                         ensure_repo_and_push(
                             local_dir=ckpt_dir,
                             repo_id=cfg["hf_repo"],
@@ -498,6 +547,13 @@ def main():
                             wandb.log({"milestone/words": next_target, "milestone/branch": branch}, step=milestones.state.global_step)
                     except Exception as e:
                         print(f"\n⚠️  Push failed for {branch}: {e}\n")
+                        # Add more detailed error info
+                        import traceback
+                        print(f"Full error traceback:\n{traceback.format_exc()}")
+                        # Continue training even if push fails
+                        milestones.mark_done(next_target)  # Mark as done so we don't retry
+                        milestones.save()
+
 
         # ----- Eval -----
         model.eval()
@@ -519,11 +575,17 @@ def main():
                 total_tokens += accelerator.gather_for_metrics(n.detach()).sum().item()
 
         dev_loss = total_loss / max(1, total_tokens)
+        dev_perplexity = math.exp(dev_loss) if dev_loss < 10 else float('inf')
+        
         if is_main:
-            logger.info(f"Eval loss/token: {dev_loss:.4f}")
+            logger.info(f"Eval loss: {dev_loss:.4f}, Perplexity: {dev_perplexity:.2f}")
             if cfg.get("wandb_mode", "online") != "disabled":
                 import wandb
-                wandb.log({"eval/loss": dev_loss}, step=milestones.state.global_step)
+                wandb.log({
+                    "eval/loss": dev_loss,
+                    "eval/perplexity": dev_perplexity,
+                    "eval/epoch": epoch
+                }, step=milestones.state.global_step)
             milestones.save()
             best_dir = output_dir / "best"
             save_local_checkpoint(accelerator.unwrap_model(model), cfg, Path(args.config), best_dir, mixed_hf=(args.model=="mixed"))

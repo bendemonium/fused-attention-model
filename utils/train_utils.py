@@ -103,7 +103,7 @@ def load_tokenized_hf_dataset(
     print(f"Loaded dataset with {len(dataset) if hasattr(dataset, '__len__') else 'streaming'} examples")
     return dataset
 
-def create_data_collator(tokenizer, mlm_probability: float = 0.15):
+def create_data_collator(tokenizer, mlm_probability: float = 0.15, max_length: Optional[int] = None):
     """Create appropriate data collator for MLM training"""
     from transformers import DataCollatorForLanguageModeling
     
@@ -118,7 +118,8 @@ def create_data_collator(tokenizer, mlm_probability: float = 0.15):
         tokenizer=tokenizer,
         mlm=True,
         mlm_probability=mlm_probability,
-        return_tensors="pt"
+        return_tensors="pt",
+        max_length=max_length  # Respect max_length if provided
     )
 
 # =========================
@@ -375,20 +376,56 @@ def ensure_repo_and_push(
     create_ok: bool = True,
     private: bool = False,
 ):
+    """Bulletproof repo creation and pushing"""
     api = HfApi(token=hf_token)
+    
+    # ALWAYS try to create repo first
     if create_ok:
         try:
-            create_repo(repo_id, token=hf_token, private=private, exist_ok=True)
-        except Exception:
-            pass
-    upload_folder(
-        repo_id=repo_id,
-        folder_path=str(local_dir),
-        path_in_repo="",
-        commit_message=f"Checkpoint push @ {branch}",
-        revision=branch,
-        token=hf_token,
-    )
+            from huggingface_hub import create_repo
+            create_repo(
+                repo_id, 
+                token=hf_token, 
+                private=private, 
+                exist_ok=True,
+                repo_type="model"  # Explicitly specify model repo
+            )
+            print(f"✅ Repo {repo_id} created/verified")
+        except Exception as e:
+            print(f"⚠️ Repo creation warning (may already exist): {e}")
+            # Don't fail - repo might already exist
+    
+    # Create branch if it doesn't exist
+    try:
+        api.create_branch(repo_id, branch=branch, token=hf_token, exist_ok=True)
+        print(f"✅ Branch {branch} created/verified")
+    except Exception as e:
+        print(f"⚠️ Branch creation warning: {e}")
+    
+    # Upload with retries
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            upload_folder(
+                repo_id=repo_id,
+                folder_path=str(local_dir),
+                path_in_repo="",
+                commit_message=f"Checkpoint push @ {branch}",
+                revision=branch,
+                token=hf_token,
+                create_pr=False  # Don't create PR, push directly
+            )
+            print(f"✅ Successfully pushed to {repo_id}:{branch}")
+            return
+        except Exception as e:
+            if attempt < max_retries - 1:
+                print(f"⚠️ Push attempt {attempt + 1} failed: {e}")
+                print(f"🔄 Retrying in 5 seconds...")
+                import time
+                time.sleep(5)
+            else:
+                print(f"❌ Push failed after {max_retries} attempts: {e}")
+                raise
 
 
 def snapshot_modeling_files(project_root: Path, dest_dir: Path):
