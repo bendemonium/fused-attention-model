@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from transformers import get_scheduler
+from transformers import get_scheduler, AutoTokenizer
 
 from model.fuseformerconfig import FuseFormerConfig
 from model.fuseformer import FuseFormerForMaskedLM
@@ -21,16 +21,18 @@ from model.hyperbolic import HyperbolicEncoder
 # Utils
 from utils.train_utils import (
     load_yaml_cfg, setup_wandb,
+    load_tokenized_hf_dataset, create_data_collator, analyze_tokenized_dataset, validate_batch,
     hf_download_and_load_pkl, nonpad_token_count, MilestoneManager,
     ensure_repo_and_push, snapshot_modeling_files, save_local_checkpoint,
-    split_params_euclid_vs_anchors, ProgressMeter, prefer_bf16
+    split_params_euclid_vs_anchors, ProgressMeter, prefer_bf16,
+    safe_forward_step
 )
 
 logger = get_logger(__name__)
 
 
 # -----------------------------
-# Dataset wrappers
+# Dataset wrappers (LEGACY - for pickle datasets)
 # -----------------------------
 
 class TokenizedListDataset(Dataset):
@@ -158,6 +160,122 @@ class HyperbolicForMLM(nn.Module):
 
 
 # -----------------------------
+# Data loading logic
+# -----------------------------
+
+def load_data(cfg: Dict, is_main: bool):
+    """Load data from either HF tokenized dataset or legacy pickle format"""
+    
+    # NEW: HF tokenized dataset path
+    if "dataset_name" in cfg:
+        if is_main:
+            logger.info(f"🔄 Loading HF tokenized dataset: {cfg['dataset_name']}")
+        
+        # Load tokenizer for data collator
+        tokenizer_name = cfg.get("tokenizer_name", "gpt2")
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        # Load datasets
+        train_dataset = load_tokenized_hf_dataset(
+            cfg["dataset_name"], 
+            split=cfg.get("train_split", "train"),
+            streaming=cfg.get("streaming", False),
+            token=cfg.get("hf_token", os.environ.get("HF_TOKEN"))
+        )
+        
+        dev_split = cfg.get("dev_split", "dev")
+        try:
+            dev_dataset = load_tokenized_hf_dataset(
+                cfg["dataset_name"], 
+                split=dev_split,
+                streaming=cfg.get("streaming", False),
+                token=cfg.get("hf_token", os.environ.get("HF_TOKEN"))
+            )
+        except Exception as e:
+            if is_main:
+                logger.warning(f"Could not load dev split '{dev_split}': {e}")
+                logger.info("Using validation split or splitting train data")
+            try:
+                dev_dataset = load_tokenized_hf_dataset(
+                    cfg["dataset_name"], 
+                    split="validation",
+                    streaming=cfg.get("streaming", False),
+                    token=cfg.get("hf_token", os.environ.get("HF_TOKEN"))
+                )
+            except:
+                # Split train data 90/10
+                if hasattr(train_dataset, 'train_test_split'):
+                    split_data = train_dataset.train_test_split(test_size=0.1, seed=42)
+                    train_dataset = split_data['train']
+                    dev_dataset = split_data['test']
+                else:
+                    # For streaming datasets, use train for both (not ideal but workable)
+                    dev_dataset = train_dataset
+        
+        if is_main:
+            logger.info(f"📊 Analyzing dataset...")
+            analyze_tokenized_dataset(train_dataset)
+        
+        # Create data collator for MLM
+        data_collator = create_data_collator(
+            tokenizer, 
+            mlm_probability=cfg.get("mlm_probability", 0.15)
+        )
+        
+        # Create DataLoaders
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=cfg.get("batch_size", 32),
+            shuffle=not cfg.get("streaming", False),  # No shuffle for streaming
+            num_workers=cfg.get("num_workers", 2),
+            collate_fn=data_collator,
+            pin_memory=True
+        )
+        
+        dev_loader = DataLoader(
+            dev_dataset,
+            batch_size=cfg.get("eval_batch_size", cfg.get("batch_size", 32)),
+            shuffle=False,
+            num_workers=cfg.get("num_workers", 2),
+            collate_fn=data_collator,
+            pin_memory=True
+        )
+        
+        return train_loader, dev_loader, tokenizer
+    
+    # LEGACY: Pickle-based loading
+    else:
+        if is_main:
+            logger.info("📦 Loading legacy pickle dataset format")
+        
+        dataset_repo = cfg["dataset_repo"]
+        revision = cfg.get("dataset_revision", None)
+        hf_token_data = cfg.get("dataset_hf_token", os.environ.get("HF_TOKEN", None))
+
+        train_examples = hf_download_and_load_pkl(dataset_repo, cfg["train_pkl"], revision=revision, token=hf_token_data)
+        dev_examples = hf_download_and_load_pkl(dataset_repo, cfg["dev_pkl"], revision=revision, token=hf_token_data)
+        
+        if is_main:
+            logger.info(f"Loaded from HF dataset repo '{dataset_repo}': train={len(train_examples)} rows, dev={len(dev_examples)} rows")
+
+        pad_id = int(cfg.get("pad_token_id", 0))
+        mask_id = int(cfg.get("mask_token_id", 103))
+        vocab_size = int(cfg["vocab_size"])
+        mlm_prob = float(cfg.get("mlm_prob", 0.15))
+
+        train_ds = TokenizedListDataset(train_examples, pad_token_id=pad_id)
+        dev_ds = TokenizedListDataset(dev_examples, pad_token_id=pad_id)
+        collate_fn = collate_builder(pad_id, vocab_size, mask_id, mlm_prob)
+
+        train_loader = DataLoader(train_ds, batch_size=int(cfg.get("batch_size", 32)), shuffle=True, num_workers=int(cfg.get("num_workers", 2)), collate_fn=collate_fn)
+        dev_loader = DataLoader(dev_ds, batch_size=int(cfg.get("eval_batch_size", cfg.get("batch_size", 32))), shuffle=False, num_workers=int(cfg.get("num_workers", 2)), collate_fn=collate_fn)
+        
+        return train_loader, dev_loader, None
+
+
+# -----------------------------
 # Training
 # -----------------------------
 
@@ -180,27 +298,8 @@ def main():
     # WandB (main process only)
     wandb = setup_wandb(cfg) if is_main else None
 
-    # ----- Load pickled, already-tokenized datasets from HF DATASET REPO -----
-    dataset_repo = cfg["dataset_repo"]
-    revision = cfg.get("dataset_revision", None)
-    hf_token_data = cfg.get("dataset_hf_token", os.environ.get("HF_TOKEN", None))
-
-    train_examples = hf_download_and_load_pkl(dataset_repo, cfg["train_pkl"], revision=revision, token=hf_token_data)
-    dev_examples = hf_download_and_load_pkl(dataset_repo, cfg["dev_pkl"], revision=revision, token=hf_token_data)
-    if is_main:
-        logger.info(f"Loaded from HF dataset repo '{dataset_repo}': train={len(train_examples)} rows, dev={len(dev_examples)} rows")
-
-    pad_id = int(cfg.get("pad_token_id", 0))
-    mask_id = int(cfg.get("mask_token_id", 103))
-    vocab_size = int(cfg["vocab_size"])
-    mlm_prob = float(cfg.get("mlm_prob", 0.15))
-
-    train_ds = TokenizedListDataset(train_examples, pad_token_id=pad_id)
-    dev_ds = TokenizedListDataset(dev_examples, pad_token_id=pad_id)
-    collate_fn = collate_builder(pad_id, vocab_size, mask_id, mlm_prob)
-
-    train_loader = DataLoader(train_ds, batch_size=int(cfg.get("batch_size", 32)), shuffle=True, num_workers=int(cfg.get("num_workers", 2)), collate_fn=collate_fn)
-    dev_loader = DataLoader(dev_ds, batch_size=int(cfg.get("eval_batch_size", cfg.get("batch_size", 32))), shuffle=False, num_workers=int(cfg.get("num_workers", 2)), collate_fn=collate_fn)
+    # ----- Load data -----
+    train_loader, dev_loader, tokenizer = load_data(cfg, is_main)
 
     # ----- Model -----
     if args.model == "mixed":
@@ -253,19 +352,36 @@ def main():
             logger.info(f"Epoch {epoch+1}/{epochs}")
 
         for step, batch in enumerate(train_loader):
+            # Validate batch for debugging
+            validate_batch(batch, milestones.state.global_step)
+            
             device_type = accelerator.device.type  # 'cuda' or 'cpu'
             amp_dtype = torch.bfloat16 if (device_type == "cuda" and use_bf16) else torch.float16
+            
+            # Use safe forward step for numerical stability
             with torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=(device_type == "cuda")):
-                outputs = model(**batch)
+                outputs = safe_forward_step(model, batch, milestones.state.global_step, amp_enabled=(device_type == "cuda"))
                 logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
                 labels = batch["labels"]
 
-                # Finite logits guard
+                # Enhanced finite logits guard
                 if not torch.isfinite(logits).all().item():
-                    if is_main and (step % 50 == 0):
+                    if is_main:
                         lmin = logits.detach().float().amin().item()
                         lmax = logits.detach().float().amax().item()
-                        logger.warning(f"[step {step}] non-finite logits: min={lmin:.3e} max={lmax:.3e}; skipping step.")
+                        nan_count = torch.isnan(logits).sum().item()
+                        inf_count = torch.isinf(logits).sum().item()
+                        logger.error(f"❌ [step {milestones.state.global_step}] Non-finite logits detected!")
+                        logger.error(f"   Min: {lmin:.3e}, Max: {lmax:.3e}")
+                        logger.error(f"   NaN count: {nan_count}, Inf count: {inf_count}")
+                        logger.error(f"   Batch shape: {logits.shape}")
+                        
+                        # For your NaN debugging - this is where you'd add breakpoint
+                        if milestones.state.global_step < 20:  # Early NaN detection
+                            logger.error("🚨 EARLY NaN DETECTED - This is likely the masking issue!")
+                            # Uncomment for debugging:
+                            # import pdb; pdb.set_trace()
+                    
                     optim_euclid.zero_grad(set_to_none=True)
                     continue
 
@@ -274,8 +390,8 @@ def main():
 
                 # Empty target guard (common MLM pitfall)
                 if n_valid.item() == 0:
-                    if is_main and (step % 50 == 0):
-                        logger.warning(f"[step {step}] 0 valid targets in batch; skipping backward.")
+                    if is_main and (milestones.state.global_step % 50 == 0):
+                        logger.warning(f"[step {milestones.state.global_step}] 0 valid targets in batch; skipping backward.")
                     continue
 
                 vocab = logits.size(-1)
@@ -318,13 +434,21 @@ def main():
                     milestones.save()
                     save_local_checkpoint(accelerator.unwrap_model(model), cfg, Path(args.config), ckpt_dir, mixed_hf=(args.model=="mixed"))
                     snapshot_modeling_files(Path("."), ckpt_dir / "models")
-                    tok_dir = cfg.get("tokenizer_dir", None)
-                    if tok_dir:
-                        dst = ckpt_dir / "tokenizer"
-                        dst.mkdir(parents=True, exist_ok=True)
-                        for p in Path(tok_dir).glob("*"):
-                            if p.is_file():
-                                shutil.copyfile(p, dst / p.name)
+                    
+                    # Save tokenizer if available
+                    if tokenizer is not None:
+                        tok_dir = ckpt_dir / "tokenizer"
+                        tokenizer.save_pretrained(str(tok_dir))
+                    elif "tokenizer_dir" in cfg:
+                        # Legacy tokenizer handling
+                        tok_dir = cfg.get("tokenizer_dir", None)
+                        if tok_dir:
+                            dst = ckpt_dir / "tokenizer"
+                            dst.mkdir(parents=True, exist_ok=True)
+                            for p in Path(tok_dir).glob("*"):
+                                if p.is_file():
+                                    shutil.copyfile(p, dst / p.name)
+                    
                     try:
                         ensure_repo_and_push(
                             local_dir=ckpt_dir,

@@ -21,7 +21,6 @@ then set up env
 ```
 python -m venv bb-env
 source bb-env/bin/activate
-source bb-env/bin/activate
 ```
 
 ```
@@ -72,6 +71,4 @@ export $(grep -v '^#' .env | xargs)
 
 ```
 pip3 install deepspeed
-
-python -m accelerate.commands.launch scripts/train.py --config configs/mixed_test.yaml --model mixed
 ```

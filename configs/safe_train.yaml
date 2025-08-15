@@ -1,5 +1,5 @@
 model:
-  vocab_size: 30522  # Standard BERT vocab size
+  vocab_size: 50257  # GPT2
   max_position_embeddings: 512
   d_model: 768
   num_layers: 12

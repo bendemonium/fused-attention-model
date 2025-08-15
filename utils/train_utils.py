@@ -11,7 +11,7 @@ import pickle
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import yaml
 import torch
@@ -19,6 +19,12 @@ import numpy as np
 from tqdm.auto import tqdm
 from huggingface_hub import HfApi, create_repo, upload_folder, hf_hub_download
 
+# NEW: HuggingFace datasets support
+try:
+    from datasets import load_dataset, Dataset, DatasetDict
+    HF_DATASETS_AVAILABLE = True
+except ImportError:
+    HF_DATASETS_AVAILABLE = False
 
 # =========================
 # YAML / Config
@@ -66,7 +72,50 @@ def setup_wandb(cfg: Dict[str, Any]) -> Optional[Any]:
 
 
 # =========================
-# HF dataset repo -> pickled splits
+# NEW: HF Tokenized Dataset Loading
+# =========================
+
+def load_tokenized_hf_dataset(
+    dataset_name: str,
+    split: str = "train",
+    streaming: bool = False,
+    token: Optional[str] = None
+) -> Union[Dataset, Any]:
+    """Load a tokenized HF dataset (like the one you just pushed)"""
+    if not HF_DATASETS_AVAILABLE:
+        raise ImportError("datasets library not installed. pip install datasets")
+    
+    print(f"Loading {dataset_name} split={split}")
+    dataset = load_dataset(
+        dataset_name,
+        split=split,
+        streaming=streaming,
+        token=token
+    )
+    
+    # Verify it has the expected tokenized fields
+    if hasattr(dataset, 'column_names'):
+        required_cols = ['input_ids', 'attention_mask']
+        missing = [col for col in required_cols if col not in dataset.column_names]
+        if missing:
+            raise ValueError(f"Dataset missing required columns: {missing}")
+    
+    print(f"Loaded dataset with {len(dataset) if hasattr(dataset, '__len__') else 'streaming'} examples")
+    return dataset
+
+def create_data_collator(tokenizer, mlm_probability: float = 0.15):
+    """Create appropriate data collator for MLM training"""
+    from transformers import DataCollatorForLanguageModeling
+    
+    return DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=True,
+        mlm_probability=mlm_probability,
+        return_tensors="pt"
+    )
+
+# =========================
+# HF dataset repo -> pickled splits (LEGACY)
 # =========================
 
 def _to_list_of_dicts(obj: Any) -> List[Dict[str, Any]]:
@@ -196,6 +245,69 @@ def nonpad_token_count(attention_mask: torch.Tensor) -> int:
 
 
 # =========================
+# NEW: Dataset Statistics & Validation
+# =========================
+
+def analyze_tokenized_dataset(dataset, sample_size: int = 1000):
+    """Analyze tokenized dataset for training insights"""
+    print("📊 Dataset Analysis:")
+    
+    if hasattr(dataset, '__len__'):
+        total_size = len(dataset)
+        print(f"Total examples: {total_size:,}")
+    else:
+        total_size = None
+        print("Dataset size: Unknown (streaming)")
+    
+    # Sample some examples for analysis
+    sample_size = min(sample_size, total_size) if total_size else sample_size
+    sample = dataset.take(sample_size) if hasattr(dataset, 'take') else [dataset[i] for i in range(sample_size)]
+    
+    lengths = []
+    for example in sample:
+        if isinstance(example, dict) and 'input_ids' in example:
+            lengths.append(len(example['input_ids']))
+        elif hasattr(example, 'input_ids'):
+            lengths.append(len(example.input_ids))
+    
+    if lengths:
+        print(f"Sequence lengths (from {len(lengths)} samples):")
+        print(f"  Mean: {np.mean(lengths):.1f}")
+        print(f"  Median: {np.median(lengths):.1f}")
+        print(f"  Min: {min(lengths)}")
+        print(f"  Max: {max(lengths)}")
+        print(f"  95th percentile: {np.percentile(lengths, 95):.1f}")
+        
+        # Estimate total tokens
+        if total_size:
+            est_total_tokens = total_size * np.mean(lengths)
+            est_total_words = est_total_tokens * 0.75  # rough estimate
+            print(f"Estimated total tokens: {est_total_tokens:,.0f}")
+            print(f"Estimated total words: {est_total_words:,.0f}")
+
+def validate_batch(batch: Dict[str, torch.Tensor], step: int):
+    """Validate a training batch for common issues"""
+    if step % 100 == 0:  # Only validate occasionally
+        if 'input_ids' in batch:
+            ids = batch['input_ids']
+            
+            # Check for NaN/inf in input
+            if torch.isnan(ids.float()).any():
+                raise ValueError(f"NaN detected in input_ids at step {step}")
+            
+            # Check for reasonable token range
+            if ids.min() < 0 or ids.max() > 100000:  # Reasonable tokenizer vocab size
+                print(f"Warning: Unusual token IDs at step {step}: min={ids.min()}, max={ids.max()}")
+        
+        if 'attention_mask' in batch:
+            mask = batch['attention_mask']
+            
+            # Check for all-zero attention masks (would cause issues)
+            all_zero_rows = (mask.sum(dim=1) == 0).sum()
+            if all_zero_rows > 0:
+                print(f"Warning: {all_zero_rows} sequences with all-zero attention mask at step {step}")
+
+# =========================
 # Milestones
 # =========================
 
@@ -280,7 +392,7 @@ def snapshot_modeling_files(project_root: Path, dest_dir: Path):
     dest_dir.mkdir(parents=True, exist_ok=True)
     model_files = [
         "model/fuseformer.py",
-        "model/fuseformerconfig.py",
+        "model/fuseformerconfig.py", 
         "model/euclidean.py",
         "model/hyperbolic.py",
         "model/hyperplanes.py",
