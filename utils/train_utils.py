@@ -33,6 +33,18 @@ def load_yaml_cfg(path: str) -> Dict[str, Any]:
 
 
 # =========================
+# Training utilities
+# =========================
+
+def safe_forward_step(model, batch, step: int, amp_enabled: bool = True):
+    """Safely perform a forward step with optional AMP disable for early steps."""
+    if step < 100 and amp_enabled:
+        # Disable AMP for first 100 steps to ensure stability
+        with torch.cuda.amp.autocast(enabled=False):
+            return model(**batch)
+    return model(**batch)
+
+# =========================
 # Weights & Biases
 # =========================
 

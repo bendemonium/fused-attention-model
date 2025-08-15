@@ -71,5 +71,7 @@ export $(grep -v '^#' .env | xargs)
 # test run
 
 ```
+pip3 install deepspeed
+
 python -m accelerate.commands.launch scripts/train.py --config configs/mixed_test.yaml --model mixed
 ```

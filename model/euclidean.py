@@ -32,7 +32,7 @@ def masked_rowwise_softmax(scores: torch.Tensor, mask: Optional[torch.Tensor], d
 
 class MultiHeadAttentionEuclid(nn.Module):
     """
-    Standard multi-head self-attention (Euclidean).
+    Standard multi-head self-attention (Euclidean) with improved masking.
     Returns:
       - if return_attn=False: Tensor (B,T,D)
       - if return_attn=True: Tuple[Tensor (B,T,D), Tensor (B,H,T,T)]
@@ -52,6 +52,21 @@ class MultiHeadAttentionEuclid(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
+        
+        # QKV projections
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        
+        # Dropout layers
+        self.attn_dropout = nn.Dropout(attn_dropout)
+        self.proj_dropout = nn.Dropout(proj_dropout)
+        
+        # RoPE if requested
+        self.use_rope = use_rope
+        if use_rope:
+            self.rope = RotaryEmbedding(self.head_dim, max_seq_len=rope_max_seq_len)
         self.scale = self.head_dim ** -0.5
 
         self.q_proj = nn.Linear(d_model, d_model, bias=True)
