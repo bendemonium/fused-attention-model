@@ -1,3 +1,4 @@
+# model/fusion.py
 from __future__ import annotations
 from typing import Optional, Tuple
 
@@ -6,7 +7,12 @@ import torch.nn as nn
 import geoopt
 
 # Reuse Lorentz ops from the hyperbolic module (no circular import there)
-from .hyperbolic import minkowski_inner, exp_map, log_map, origin
+from .hyperbolic import minkowski_inner, exp_map, log_map, origin, fl_from_z, hyperplane_gate_score
+
+# ---------- numeric safety constants (match hyperbolic.py style) ----------
+EPS = 1e-6
+TINY = 1e-15
+MAX_STEP_NORM = 20.0   # cap tangent step size before exp_map
 
 
 def project_tangent(p: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -22,93 +28,100 @@ def project_tangent(p: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     return v + coeff * p
 
 
+def lorentz_norm_tangent(v: torch.Tensor) -> torch.Tensor:
+    """||v||_L in tangent (uses Minkowski inner)."""
+    vv = minkowski_inner(v, v)
+    return torch.sqrt(vv.clamp_min(TINY))
+
+
 class FusionOnManifold(nn.Module):
     """
-    On-manifold fusion of:
-      - Euclidean features e_out ∈ R^{B×T×D}
-      - Hyperbolic points y_h ∈ H^n ⊂ R^{n+1} as ambient coords (B×T×A), A=n+1
+    Geometry-aware fusion (Euclid + Hyperbolic) with Euclidean parametrization:
 
-    Steps:
-      1) Compute gate α(x)∈(0,1) from [e_out, log_p(y_h)→R^D]
-      2) Lift e_out to tangent at anchor p (ManifoldParameter), then exp_p → x_e ∈ H^n
-      3) Geodesic interpolation: z_m = Exp_{x_e}( α * Log_{x_e}(y_h) )
-      4) Map back to tangent at p: z_t = Log_p(z_m) ∈ R^{A}
-      5) Linear proj A→D to return fused Euclidean features (B×T×D)
+      Inputs:
+        e_out : (B,T,D)  Euclidean stream (post-attn)
+        y_h   : (B,T,A)  Hyperbolic stream (ambient Lorentz coords), A = n+1
 
-    Returns:
-      z_fused: (B,T,D)
-      alpha:   (B,T,1)  (for interpretability)
+      Parameters (learned, Euclidean):
+        - Anchor z_anchor ∈ R^n  → p = FL(z_anchor) ∈ H^n   (for log/exp maps)
+        - Gate   z_gate  ∈ R^n, a_gate ∈ R   → α = σ(γ * s(x)) with
+              s(x) = cosh(a)<z, x_r> - sinh(a)||z|| x0     (Eq. in §4.2)
+        - Linear lifts/proj: e_to_ambient: D→A, out_proj: A→D
+
+      Steps:
+        1) α(x) from hyperbolic hyperplane score at y_h
+        2) Lift e_out to T_p via e_to_ambient, project to tangent, then Exp_p -> x_e
+        3) Geodesic interp:  z_m = Exp_{x_e}( α * Log_{x_e}(y_h) )
+        4) Back to Euclid:  z_tan = Log_p(z_m),  z_fused = out_proj(z_tan)
     """
-    def __init__(
-        self,
-        d_model: int,
-        ambient_dim: int,             # A = n+1
-        gate_hidden: int = 64,
-        fusion_karcher_steps: int = 1 # reserved (we use single-step geodesic interp)
-    ):
+    def __init__(self,
+                 d_model: int,
+                 ambient_dim: int,          # A = n+1
+                 gate_hidden: int = 64,     # kept for API compatibility (unused)
+                 fusion_karcher_steps: int = 1,  # kept for API compatibility
+                 max_step_norm: float = 5.0,
+                 max_rad: float = 10.0,
+                 score_scale_init: float = 1.0):
         super().__init__()
         self.D = d_model
         self.A = ambient_dim
+        self.n = ambient_dim - 1
+        self.max_step = max_step_norm
+        self.max_rad = max_rad
 
-        # ---- Learnable anchor p ∈ H^n (Riemannian parameter) ----
-        self.manifold = geoopt.manifolds.Lorentz()
-        with torch.no_grad():
-            o = origin(self.A - 1, dtype=torch.float32, device=torch.device("cpu"))  # (A,)
-            # tiny tangent at origin, then move to a valid point near origin
-            eps = torch.zeros(self.A)
-            eps[1:] = torch.randn(self.A - 1) * 1e-2
-            p0 = exp_map(o, eps)
-        self.anchor = geoopt.ManifoldParameter(p0, manifold=self.manifold, requires_grad=True)
+        # ----- Euclidean parametrization for anchor & gate -----
+        self.z_anchor = nn.Parameter(torch.zeros(self.n))           # R^n
+        nn.init.normal_(self.z_anchor, mean=0.0, std=1e-2)
 
-        # ---- A few small projections for gating & I/O ----
-        # Use log_p(y_h) -> A, then A->D for gating feature
-        self.h_log_to_d = nn.Linear(self.A, self.D, bias=True)   # φ_h
-        # Lift Euclid to ambient for tangent at p
-        self.e_to_ambient = nn.Linear(self.D, self.A, bias=True) # ψ_e
-        # Output projection from ambient tangent back to D
-        self.out_proj = nn.Linear(self.A, self.D, bias=True)     # W_o
+        self.z_gate   = nn.Parameter(torch.zeros(self.n))           # R^n (direction)
+        nn.init.normal_(self.z_gate, mean=0.0, std=1e-2)
+        self.a_gate   = nn.Parameter(torch.tensor(0.0))             # scalar offset
+        self.score_scale = nn.Parameter(torch.tensor(float(score_scale_init)))  # γ
 
-        # Gate α from concatenated Euclid & hyperbolic (in D)
-        self.gate = nn.Sequential(
-            nn.Linear(2 * self.D, gate_hidden),
-            nn.GELU(),
-            nn.Linear(gate_hidden, 1),
-        )
+        # ----- Linear lifts/projections -----
+        self.e_to_ambient = nn.Linear(self.D, self.A, bias=True)    # D -> A
+        self.out_proj      = nn.Linear(self.A, self.D, bias=True)   # A -> D
 
-        self.sigmoid = nn.Sigmoid()
+        # Dropouts (match prior API; keep off by default)
+        self.dropout_out = nn.Dropout(p=0.0)
 
     def forward(self, e_out: torch.Tensor, y_h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        e_out: (B,T,D)  Euclidean stream (post-attn)
-        y_h:   (B,T,A)  Hyperbolic stream (ambient coords on H^n)
-
-        returns:
-          z_fused: (B,T,D)
-          alpha:   (B,T,1)
+        e_out: (B,T,D), y_h: (B,T,A) with A=n+1 on H^n (Lorentz coords)
+        returns (z_fused: (B,T,D), alpha: (B,T,1))
         """
         B, T, D = e_out.shape
-        assert D == self.D, "d_model mismatch"
+        assert D == self.D and y_h.size(-1) == self.A
 
-        # ---- Gate α(e, y) ∈ (0,1) ----
-        # Use log-map at anchor p to extract hyperbolic features in ambient tangent, then A->D
-        p = self.anchor.to(y_h.dtype).to(y_h.device).view(1, 1, self.A).expand(B, T, self.A)  # (B,T,A)
-        y_tan_at_p = log_map(p, y_h)                          # (B,T,A)
-        h_feat = self.h_log_to_d(y_tan_at_p)                  # (B,T,D)
-        g_in = torch.cat([e_out, h_feat], dim=-1)             # (B,T,2D)
-        alpha = self.sigmoid(self.gate(g_in))                 # (B,T,1)
+        # ----- 1) Hyperplane gate α(y_h) ∈ (0,1) -----
+        # score s(x) = cosh(a)<z,x_r> - sinh(a)||z|| x0
+        s = hyperplane_gate_score(y_h, self.z_gate, self.a_gate, max_a=self.max_rad)  # (B,T,1)
+        alpha = torch.sigmoid(self.score_scale * s).clamp(1e-6, 1.0 - 1e-6)           # (B,T,1)
 
-        # ---- Lift Euclidean to H^n via tangent at p ----
-        v_raw = self.e_to_ambient(e_out)                      # (B,T,A)
-        v_tan = project_tangent(p, v_raw)                     # (B,T,A) ensure <p,v>=0
-        x_e = exp_map(p, v_tan)                               # (B,T,A) on H^n
+        # ----- 2) Build anchor p from Euclidean z_anchor via FL -----
+        p = fl_from_z(self.z_anchor, max_rad=self.max_rad)                  # (A,)
+        p = p.to(y_h.dtype).to(y_h.device).view(1, 1, self.A).expand(B, T, self.A)
 
-        # ---- Geodesic interpolation toward y_h with weight α ----
-        # z_m = Exp_{x_e}( α * Log_{x_e}(y_h) )
-        log_xe_y = log_map(x_e, y_h)                          # (B,T,A)
-        step = alpha * log_xe_y                                # (B,T,A)
-        z_m = exp_map(x_e, step)                              # (B,T,A)
+        # Lift Euclidean stream to tangent at p and Exp_p
+        v_raw = self.e_to_ambient(e_out)                                    # (B,T,A)
+        v_tan = project_tangent(p, v_raw)                                   # <p,v>=0
+        # Trust region on tangent step
+        v_norm = torch.sqrt(torch.clamp(torch.abs(minkowski_inner(v_tan, v_tan)), min=1e-12)).unsqueeze(-1)
+        scale = (self.max_step / v_norm).clamp_max(1.0)
+        v_tan = v_tan * scale
+        x_e = exp_map(p, v_tan)                                             # (B,T,A)
 
-        # ---- Map back to Euclid: log at anchor p then linear A->D ----
-        z_tan = log_map(p, z_m)                               # (B,T,A)
-        z_fused = self.out_proj(z_tan)                        # (B,T,D)
+        # ----- 3) Geodesic interpolation: Exp_{x_e}( α * Log_{x_e}(y_h) ) -----
+        log_xe_y = log_map(x_e, y_h)                                        # (B,T,A)
+        # cap the tangent move at max_step too
+        u_norm = torch.sqrt(torch.clamp(torch.abs(minkowski_inner(log_xe_y, log_xe_y)), min=1e-12)).unsqueeze(-1)
+        scale_u = (self.max_step / u_norm).clamp_max(1.0)
+        step = alpha * (log_xe_y * scale_u)
+        z_m = exp_map(x_e, step)                                            # (B,T,A)
+
+        # ----- 4) Back to Euclid: Log_p then A->D -----
+        z_tan = log_map(p, z_m)                                             # (B,T,A)
+        z_fused = self.out_proj(z_tan)                                      # (B,T,D)
+        z_fused = self.dropout_out(z_fused)
+
         return z_fused, alpha

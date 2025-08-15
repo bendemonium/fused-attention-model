@@ -76,6 +76,37 @@ def origin(n: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
     o[0] = 1.0
     return o
 
+def fl_from_z(z_spatial: torch.Tensor, max_rad: float = 10.0, eps: float = 1e-9) -> torch.Tensor:
+    """
+    Euclidean -> Lorentz map FL(z) = (cosh||z||, sinh||z|| * z/||z||)
+    z_spatial: (..., n)
+    returns:   (..., n+1) on H^n
+    """
+    r = z_spatial.norm(dim=-1, keepdim=True).clamp_min(eps)             # (...,1)
+    r_cap = r.clamp_max(max_rad)                                        # cap radius
+    zr = z_spatial / r                                                  # unit
+    x0 = torch.cosh(r_cap)                                              # (...,1)
+    xr = torch.sinh(r_cap) * zr                                         # (...,n)
+    return torch.cat([x0, xr], dim=-1)                                  # (...,n+1)
+
+def hyperplane_gate_score(x_lr: torch.Tensor, z: torch.Tensor, a: torch.Tensor,
+                          max_a: float = 10.0) -> torch.Tensor:
+    """
+    Score s(x) = cosh(a)<z,x_r> - sinh(a)||z|| x0   (Eq. 4.2 discussion)
+    x_lr:  (B,T,A) Lorentz points with A=n+1; x[...,0]=x0, x[...,1:]=x_r
+    z:     (n,)    Euclidean gate direction
+    a:     ()      Euclidean gate offset (scalar)
+    returns: (B,T,1)
+    """
+    n = x_lr.size(-1) - 1
+    z = z.view(1, 1, n)
+    a_c = a.clamp(min=-max_a, max=max_a)                                # stabilize
+    x0 = x_lr[..., :1]                                                  # (B,T,1)
+    xr = x_lr[..., 1:]                                                  # (B,T,n)
+    s = torch.cosh(a_c) * (xr * z).sum(dim=-1, keepdim=True) \
+        - torch.sinh(a_c) * z.norm(dim=-1, keepdim=True).clamp_min(1e-9) * x0
+    return s
+
 # ------------------------------
 # Hyperbolic Attention (Lorentz)
 # ------------------------------

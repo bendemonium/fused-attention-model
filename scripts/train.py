@@ -255,8 +255,39 @@ def main():
             logger.info(f"Epoch {epoch+1}/{epochs}")
 
         for step, batch in enumerate(train_loader):
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16 if use_bf16 else torch.float16, enabled=True):
+            device_type = accelerator.device.type  # 'cuda' or 'cpu'
+            amp_dtype = torch.bfloat16 if (device_type == "cuda" and use_bf16) else torch.float16
+            with torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=(device_type == "cuda")):
                 outputs = model(**batch)
+                logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
+                labels = batch["labels"]
+
+                # Finite logits guard
+                finite = torch.isfinite(logits).all()
+                if not finite.item():
+                    if is_main and (step % 50 == 0):
+                        lmin = logits.detach().float().amin().item()
+                        lmax = logits.detach().float().amax().item()
+                        logger.warning(f"[step {step}] non-finite logits: min={lmin:.3e} max={lmax:.3e}; skipping step.")
+                    optim_euclid.zero_grad(set_to_none=True)
+                    if optim_anchor is not None:
+                        optim_anchor.zero_grad(set_to_none=True)
+                    continue
+
+                valid_mask = (labels != -100)
+                n_valid = valid_mask.sum()
+
+                # Empty target guard (common MLM pitfall)
+                if n_valid.item() == 0:
+                    if is_main and (step % 50 == 0):
+                        logger.warning(f"[step {step}] 0 valid targets in batch; skipping backward.")
+                    # (Optionally still update progress/words below; no optimizer step.)
+                    continue
+
+                vocab = logits.size(-1)
+                loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction="sum")
+                loss_sum = loss_fct(logits.view(-1, vocab), labels.view(-1))
+                loss = loss_sum / n_valid
                 loss = outputs["loss"] if isinstance(outputs, dict) else outputs.loss
 
             accelerator.backward(loss)
@@ -332,10 +363,19 @@ def main():
         with torch.no_grad():
             for batch in dev_loader:
                 outputs = model(**batch)
-                loss = outputs["loss"] if isinstance(outputs, dict) else outputs.loss
-                n = (batch["labels"] != -100).sum().item()
-                total_loss += accelerator.gather_for_metrics(loss.detach() * n).sum().item()
-                total_tokens += accelerator.gather_for_metrics(torch.tensor([n], device=loss.device)).sum().item()
+                logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
+                labels = batch["labels"]
+
+                # Sum-reduction CE over valid targets
+                vocab = logits.size(-1)
+                loss_sum = nn.CrossEntropyLoss(ignore_index=-100, reduction="sum")(
+                    logits.view(-1, vocab), labels.view(-1)
+                )
+
+                # Accumulate across processes
+                n = (labels != -100).sum()
+                total_loss += accelerator.gather_for_metrics(loss_sum.detach()).sum().item()
+                total_tokens += accelerator.gather_for_metrics(n.detach()).sum().item()
         dev_loss = total_loss / max(1, total_tokens)
         if is_main:
             logger.info(f"Eval loss/token: {dev_loss:.4f}")
